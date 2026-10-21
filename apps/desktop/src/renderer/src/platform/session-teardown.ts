@@ -30,6 +30,13 @@ export interface SessionTeardown {
   /** The local daemon process itself. Resolves to an IPC result we ignore —
    *  a daemon that was already down is success enough. */
   stopDaemon: () => Promise<unknown>;
+  /**
+   * Enterprise session: drop the in-memory token and remove the credential
+   * sealed in the main-process vault (BND-161). Both session endings clear
+   * it — the screen they land on offers a login form, and the next person
+   * to use it may not be the one who was just signed in.
+   */
+  clearEnterpriseSession: () => Promise<unknown>;
 }
 
 /**
@@ -45,6 +52,12 @@ export async function tearDownOnLogout(t: SessionTeardown): Promise<void> {
   t.reportAuthSession(null);
   t.resetTabs();
   t.closeOverlay();
+  try {
+    await t.clearEnterpriseSession();
+  } catch {
+    // Best-effort — the sealed credential must go, but a vault error here
+    // must not block the rest of the teardown.
+  }
   try {
     await t.clearDaemonToken();
   } catch {
@@ -72,4 +85,8 @@ export function tearDownOnSessionExpiry(t: SessionTeardown): void {
   t.reportAuthSession(null);
   t.resetTabs();
   t.closeOverlay();
+  // The enterprise vault credential belongs to the session that just died;
+  // a dead JWT must not linger for whoever signs in next. Best-effort and
+  // synchronous-fire — the vault lives in the main process.
+  void t.clearEnterpriseSession().catch(() => {});
 }

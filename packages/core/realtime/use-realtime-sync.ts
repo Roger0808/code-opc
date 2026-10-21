@@ -1379,6 +1379,20 @@ export function useRealtimeSync(
       }
     });
 
+    // enterprise_revoked is a session-ending control frame: the platform's
+    // authorization for this login is gone (version bump / entitlement
+    // revoked), the server has already closed the connection, and every
+    // enterprise-gated request would now 401 ENTITLEMENT_REVOKED. Tear the
+    // session down through the same path a 401 takes (sessionExpired is
+    // idempotent) so the app lands on the login screen — on Desktop that
+    // path also clears the sealed enterprise credential. Re-login is the
+    // only way back: the exchange mints a fresh epoch.
+    const unsubEnterpriseRevoked = ws.on("enterprise_revoked", () => {
+      logger.warn("enterprise entitlement revoked; ending session");
+      onToast?.("Your enterprise sign-in was revoked. Sign in again.", "error");
+      authStore.getState().sessionExpired();
+    });
+
     const unsubMemberAdded = ws.on("member:added", (p) => {
       const { member, workspace_name } = p as MemberAddedPayload;
       const myUserId = authStore.getState().user?.id;
@@ -1845,6 +1859,7 @@ export function useRealtimeSync(
       unsubWsUpdated();
       unsubWsDeleted();
       unsubMemberRemoved();
+      unsubEnterpriseRevoked();
       unsubMemberAdded();
       unsubInvitationCreated();
       unsubInvitationAccepted();

@@ -84,6 +84,15 @@ const (
 	// RecoverOrphanedTasksForRuntime at daemon startup.
 	ReasonRuntimeRecovery Reason = "runtime_recovery"
 
+	// ReasonEnterpriseLeaseLost: an enterprise task's platform lease
+	// renewal failed (entitlement revoked, lease expired, or the platform
+	// unreachable past the lease TTL) and the daemon stopped the run
+	// fail-closed. Non-retryable: the auto-retry allowlist does not name
+	// it, and re-claim refuses at grant issuance until the platform-side
+	// authorization is restored. Written by the daemon's enterprise lease
+	// renewal loop.
+	ReasonEnterpriseLeaseLost Reason = "enterprise_lease_lost"
+
 	// ReasonTimeout: server-side or runtime-side hard timeout.
 	// Written by FailStaleTasks (server) and the daemon's per-task
 	// agent timeout path.

@@ -23,6 +23,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/enterprise"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/logger"
@@ -1834,6 +1835,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := make([]AgentTaskResponse, 0, len(claimed))
+	var enterpriseRejections []map[string]string
 	for i := range claimed {
 		if r.Context().Err() != nil {
 			break
@@ -1855,7 +1857,29 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		if handled, _ := h.repairStaleCommentPlanIfNeeded(r.Context(), &task, rtWorkspaceID); handled {
 			continue
 		}
-		resp, deliveredCommentIDs, issueSnapshot, _, _, failure := h.buildClaimedTaskResponse(r, &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID)
+		// Enterprise gate (TASK-C02): same contract as the per-runtime
+		// endpoint. A refused enterprise task is requeued and reported in
+		// enterprise_rejections; the batch continues with the rest. The server
+		// mints the task's platform lease here and hands it to the daemon in
+		// the claim payload (enterprise_lease).
+		enterpriseTask := h.enterpriseWorkspace(r.Context(), rt.WorkspaceID)
+		var enterpriseLease *EnterpriseLease
+		if enterpriseTask {
+			lease, entFailure := h.enterpriseClaimCheckpoint(r, &task, rt)
+			if entFailure != nil {
+				if _, err := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), task); err != nil {
+					slog.Error("batch claim: failed to requeue after enterprise refusal",
+						"task_id", uuidToString(task.ID), "code", entFailure.code, "error", err)
+				}
+				enterpriseRejections = append(enterpriseRejections, map[string]string{
+					"task_id": uuidToString(task.ID),
+					"reason":  entFailure.code,
+				})
+				continue
+			}
+			enterpriseLease = lease
+		}
+		resp, deliveredCommentIDs, issueSnapshot, _, _, failure := h.buildClaimedTaskResponse(r, &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID, enterpriseTask)
 		if failure != nil {
 			// Builder rejected this task (workspace isolation / chat-input);
 			// it has already settled the task where the failure requires it.
@@ -1915,6 +1939,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		}
 		resp.AuthToken = tokenStr
 		resp.RemoteMCPDaemonToken = remoteMCPToken
+		resp.EnterpriseLease = enterpriseLease
 		resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
 		out = append(out, resp)
 	}
@@ -1925,6 +1950,13 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			"total_ms", time.Since(start).Milliseconds())
 	}
 	response := map[string]any{"tasks": out}
+	if len(enterpriseRejections) > 0 {
+		// Additive metadata: enterprise tasks refused during this batch, with
+		// the machine-readable reason (enterprise_protocol_required,
+		// enterprise_lease_required, ...). All were requeued for a later
+		// claim; none are included in tasks.
+		response["enterprise_rejections"] = enterpriseRejections
+	}
 	// Only opted-in daemons understand this additive response metadata. Query
 	// after the claim so a future fire_at can shorten the long healthy-WS safety
 	// poll; a task that crossed fire_at during this request yields a bounded
@@ -2121,7 +2153,7 @@ func (h *Handler) finalizeClaimDelivery(
 		return nil
 	}
 
-	receipt, err = h.TaskService.FinalizeTaskClaim(ctx, *task, token, deliveredCommentIDs, recordCommentReceipt, authorize, issueSnapshot, daemonTokens...)
+	receipt, err = h.TaskService.FinalizeTaskClaim(ctx, *task, token, deliveredCommentIDs, recordCommentReceipt, authorize, issueSnapshot, enterpriseSkillsIssuedPayload(response), daemonTokens...)
 	if err == nil {
 		return receipt, nil, nil
 	}
@@ -2408,7 +2440,7 @@ func claimResponseAgentIdentityMatches(resp AgentTaskResponse) bool {
 // feed the same delivery receipt into FinalizeTaskClaim. A non-nil failure
 // means the task must not be dispatched; the builder has already cancelled it
 // where the failure semantics require it.
-func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string) (resp AgentTaskResponse, deliveredCommentIDs []pgtype.UUID, issueSnapshot []byte, agentSkillCount, builtinSkillCount int, failure *claimBuildFailure) {
+func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string, enterprise bool) (resp AgentTaskResponse, deliveredCommentIDs []pgtype.UUID, issueSnapshot []byte, agentSkillCount, builtinSkillCount int, failure *claimBuildFailure) {
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp = taskToResponse(*task, runtimeWorkspaceID)
 	if err := (&service.IssueWakeupService{Tasks: h.TaskService}).CheckClaim(r.Context(), *task); err != nil {
@@ -2549,6 +2581,11 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	if agent.McpConfig != nil {
 		mcpConfig = json.RawMessage(agent.McpConfig)
 	}
+	// mcpFailed tracks resolution failures for the enterprise failed-closed
+	// rule (BND-161): personal tasks keep the historical log-and-continue
+	// behavior below, but an enterprise task must never ship a partially
+	// resolved or locally-fallen-back MCP configuration.
+	mcpFailed := false
 	// Fold in the workspace MCP servers this agent has been explicitly
 	// given (GH #6062). Only bound AND enabled servers are read, so a
 	// workspace library entry nobody added reaches nothing. Read on every
@@ -2559,6 +2596,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	if bound, err := h.Queries.ListEnabledAgentMcpServers(r.Context(), agent.ID); err != nil {
 		slog.Warn("daemon claim: load agent mcp servers failed; using agent mcp_config",
 			"task_id", uuidToString(task.ID), "agent_id", uuidToString(agent.ID), "error", err)
+		mcpFailed = mcpFailed || enterprise
 	} else if len(bound) > 0 {
 		bindings := make([]WorkspaceMcpBinding, 0, len(bound))
 		for _, server := range bound {
@@ -2567,6 +2605,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		if resolved, err := ResolveAgentMcpConfig(bindings, mcpConfig); err != nil {
 			slog.Warn("daemon claim: resolve agent mcp servers failed; falling back to agent mcp_config",
 				"task_id", uuidToString(task.ID), "agent_id", uuidToString(agent.ID), "error", err)
+			mcpFailed = mcpFailed || enterprise
 		} else {
 			mcpConfig = resolved
 		}
@@ -2580,9 +2619,24 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	if composioMCPEnabled && len(task.RuntimeMcpOverlay) > 0 {
 		if merged, err := mergeMCPOverlay(mcpConfig, json.RawMessage(task.RuntimeMcpOverlay)); err != nil {
 			slog.Warn("daemon claim: merge runtime_mcp_overlay failed; falling back to agent mcp_config", "task_id", uuidToString(task.ID), "error", err)
+			mcpFailed = mcpFailed || enterprise
 		} else {
 			mcpConfig = merged
 		}
+	}
+	if enterprise {
+		// BND-161: the managed MCP set the daemon may use is decided here
+		// and nowhere else. Any failure zeroes it to the legal empty object
+		// and marks the claim failed_closed; the daemon must not fall back
+		// to local MCP configuration for enterprise tasks.
+		mcpConfig, resp.ManagedMcpStatus = enterpriseManagedMCPOutcome(mcpConfig, mcpFailed)
+		resp.Enterprise = true
+		// TASK-C06: hand the daemon the platform-published skills the
+		// originating enterprise user is entitled to, pinned to the manifest
+		// digest the platform attests. The listing is narrowed to the
+		// workspace link's tenant. Failed-closed per claim: an unavailable
+		// platform never blocks dispatch, it just ships no refs.
+		resp.EnterpriseSkills, resp.EnterpriseSkillsStatus = h.enterpriseClaimSkills(r, runtimeWorkspaceID)
 	}
 	// runtime_config is stored as JSONB and may legitimately be the
 	// empty object `{}` for agents that haven't opted into any
@@ -3850,7 +3904,29 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	outcome = "claimed"
 	buildStart = time.Now()
 
-	resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, failure := h.buildClaimedTaskResponse(r, task, runtime, runtimeID, runtimeWorkspaceID)
+	// Enterprise gate (TASK-C02): an enterprise task is only dispatched to an
+	// enterprise-capable daemon, and the SERVER mints the task's platform
+	// lease (INT-102 grant) at claim time — the daemon receives it in the
+	// claim response (enterprise_lease) and renews it while the task runs.
+	// On refusal the claim is requeued so the task is not stranded, and the
+	// daemon gets a 403 it can surface instead of a silent empty poll.
+	enterpriseTask := h.enterpriseWorkspace(r.Context(), runtime.WorkspaceID)
+	var enterpriseLease *EnterpriseLease
+	if enterpriseTask {
+		lease, entFailure := h.enterpriseClaimCheckpoint(r, task, runtime)
+		if entFailure != nil {
+			outcome = "enterprise_rejected_" + entFailure.code
+			if _, err := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), *task); err != nil {
+				slog.Error("task claim: failed to requeue after enterprise refusal",
+					"task_id", uuidToString(task.ID), "code", entFailure.code, "error", err)
+			}
+			writeEnterpriseClaimError(w, entFailure)
+			return
+		}
+		enterpriseLease = lease
+	}
+
+	resp, deliveredCommentIDs, issueSnapshot, agentSkillCount, builtinSkillCount, failure := h.buildClaimedTaskResponse(r, task, runtime, runtimeID, runtimeWorkspaceID, enterpriseTask)
 	if failure != nil {
 		outcome = failure.outcome
 		if failure.settled {
@@ -3950,6 +4026,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.AuthToken = tokenStr
 	resp.RemoteMCPDaemonToken = remoteMCPToken
+	resp.EnterpriseLease = enterpriseLease
 	task.DeliveredCommentIds = receipt
 	resp.DeliveredCommentIDs = uuidStringsOrEmpty(receipt)
 
@@ -4026,6 +4103,30 @@ func (h *Handler) ResolveTaskSkillBundles(w http.ResponseWriter, r *http.Request
 		wanted = append(wanted, service.AgentSkillBundleRef{ID: ref.ID, Source: ref.Source})
 	}
 
+	// Enterprise tasks (BND-142) resolve platform-published refs through the
+	// pinned-version resolver: publish_id + sha256 fixed by the platform,
+	// never "whatever the platform currently serves". The identity segments
+	// come from the workspace link, not from daemon input.
+	enterpriseTask := h.enterpriseWorkspace(r.Context(), runtime.WorkspaceID)
+	var entCtx *enterpriseSkillContext
+	var issuedSet map[string]struct{}
+	if enterpriseTask && hasEnterpriseRefs(req.Skills) {
+		loaded, err := h.loadEnterpriseSkillContext(r, taskWorkspaceID)
+		if err != nil {
+			slog.Error("resolve skill bundles: enterprise skill context unavailable",
+				"task_id", uuidToString(task.ID), "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to load enterprise skill context")
+			return
+		}
+		entCtx = loaded
+		// M-5: a requested enterprise ref must belong to the set THIS task's
+		// claim issued (persisted on the task row by FinalizeTaskClaim). The
+		// intersection is what stops a daemon from resolving platform skills
+		// nobody handed to this task. A missing set fails closed: nothing was
+		// issued, so nothing resolves.
+		issuedSet = issuedEnterpriseSkillSet(task.Context)
+	}
+
 	// Load ONLY what was asked for. The daemon resolves one skill per request,
 	// so serving these out of the agent's full bundle set meant reading and
 	// hashing every skill the agent has, once per request, to return one of
@@ -4042,7 +4143,42 @@ func (h *Handler) ResolveTaskSkillBundles(w http.ResponseWriter, r *http.Request
 	}
 
 	resolved := make([]service.AgentSkillData, 0, len(req.Skills))
+	var entStatuses []enterpriseSkillStatus
 	for _, ref := range req.Skills {
+		if enterpriseTask && ref.Source == enterprise.Source {
+			if _, issued := issuedSet[enterpriseIssuedSkillKey(ref.ID, ref.Hash)]; !issued {
+				// M-5: the claim never handed this ref to the task — refuse to
+				// resolve it. Dropped per-skill like a failed-closed package so
+				// the task's remaining skills still resolve; the daemon omits
+				// the ref from the run.
+				slog.Warn("resolve skill bundles: enterprise ref was not issued by this claim",
+					"task_id", uuidToString(task.ID), "publish_id", ref.ID)
+				entStatuses = append(entStatuses, enterpriseSkillStatus{
+					ID:     ref.ID,
+					Status: enterpriseSkillStatusFailedClosed,
+					Code:   enterprise.CodeNotIssued,
+				})
+				continue
+			}
+			bundle, status, err := h.resolveEnterpriseSkillBundle(r, entCtx, ref)
+			if err != nil {
+				if isEnterpriseFailedClosed(err) {
+					// The package is real but not installable as an enterprise
+					// local skill: drop just this skill, record the status,
+					// and keep resolving the rest of the task's skills.
+					failed := enterpriseFailedClosedStatus(ref, err)
+					entStatuses = append(entStatuses, *failed)
+					slog.Warn("resolve skill bundles: enterprise skill failed closed",
+						"task_id", uuidToString(task.ID), "publish_id", ref.ID, "code", failed.Code)
+					continue
+				}
+				writeEnterpriseResolveFailure(w, err)
+				return
+			}
+			resolved = append(resolved, *bundle)
+			entStatuses = append(entStatuses, *status)
+			continue
+		}
 		bundle, ok := allowed[service.AgentSkillBundleKey(ref.Source, ref.ID)]
 		if !ok {
 			writeError(w, http.StatusNotFound, "skill bundle not found")
@@ -4055,7 +4191,11 @@ func (h *Handler) ResolveTaskSkillBundles(w http.ResponseWriter, r *http.Request
 		resolved = append(resolved, bundle)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"bundles": resolved})
+	response := map[string]any{"bundles": resolved}
+	if len(entStatuses) > 0 {
+		response["enterprise_skill_status"] = entStatuses
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // trailingUserMessages returns the run of user messages after the last

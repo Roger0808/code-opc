@@ -34,6 +34,25 @@ import {
   tearDownOnSessionExpiry,
   type SessionTeardown,
 } from "./platform/session-teardown";
+import {
+  createEnterpriseStorage,
+  isEnterpriseSession,
+  restoreEnterpriseSession,
+  clearEnterpriseSession,
+} from "./platform/enterprise-session";
+
+// Overlay storage adapter that shadows `multica_token` with the in-memory
+// enterprise token while an enterprise session is active (BND-161) — the
+// enterprise credential never reaches renderer localStorage. Created once at
+// module scope; all accesses are closures over the module state.
+const enterpriseStorage = createEnterpriseStorage();
+
+// Boot-time enterprise restore, before anything below renders: CoreProvider's
+// initCore reads the credential through the storage adapter exactly once, at
+// first render, so the sealed token must already be in memory by then. This
+// runs synchronously (sendSync IPC); when there is no sealed enterprise
+// session it is a no-op and the normal personal-session path proceeds.
+restoreEnterpriseSession();
 
 // BCP-47 region tags for the <html lang> attribute, mirroring
 // apps/web/app/layout.tsx HTML_LANG. index.html ships a static lang="en";
@@ -167,6 +186,23 @@ function AppContent() {
   // inside syncDaemonOnLogin is load-bearing — see that module.
   useEffect(() => {
     if (!user || !runtimeConfig) return;
+    if (isEnterpriseSession()) {
+      // BND-161: enterprise sessions never mint or write a daemon PAT.
+      // The sync below only clears any stale personal token from the daemon
+      // profile; enterprise daemon task claims authenticate through platform
+      // leases. Target URL is still pushed so the desktop profile resolves.
+      const userId = user.id;
+      (async () => {
+        try {
+          await window.daemonAPI.setTargetApiUrl(runtimeConfig.apiUrl);
+          await window.daemonAPI.syncToken("", userId, "enterprise");
+          await window.daemonAPI.autoStart();
+        } catch (err) {
+          console.error("Failed to sync daemon on enterprise login", err);
+        }
+      })();
+      return;
+    }
     const token = localStorage.getItem("multica_token");
     if (!token) return;
     const userId = user.id;
@@ -365,6 +401,7 @@ const sessionTeardown: SessionTeardown = {
   closeOverlay: () => useWindowOverlayStore.getState().close(),
   clearDaemonToken: () => window.daemonAPI.clearToken(),
   stopDaemon: () => window.daemonAPI.stop(),
+  clearEnterpriseSession: () => clearEnterpriseSession(),
 };
 
 function handleDaemonLogout() {
@@ -457,6 +494,7 @@ export default function App() {
         <CoreProvider
           apiBaseUrl={runtimeConfigResult.config.apiUrl}
           wsUrl={runtimeConfigResult.config.wsUrl}
+          storage={enterpriseStorage}
           onLogout={
             windowContext.kind === "main" ? handleDaemonLogout : undefined
           }

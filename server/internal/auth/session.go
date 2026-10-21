@@ -41,6 +41,17 @@ const (
 	// not invalidate CSRF tokens other tabs are already holding.
 	sessionIDClaim = "sid"
 
+	// EnterpriseSessionClaim and EnterpriseVersionClaim carry the platform
+	// session epoch on enterprise session JWTs. ent_sid identifies the
+	// enterprise login (minted per exchange); ent_ver is the platform
+	// authorization version the token was signed against. Both are stamped
+	// by the enterprise exchange flow and refreshed from the database at
+	// every sliding renewal — see EnterpriseRefresher.
+	EnterpriseSessionClaim = "ent_sid"
+	EnterpriseVersionClaim = "ent_ver"
+)
+
+const (
 	// sessionRenewCheckDivisor derives the client-side re-check cadence
 	// from the configured TTL: a client that checks every TTL/10 gets
 	// roughly five attempts inside the renewal window, so several
@@ -197,6 +208,14 @@ func SessionIDFromToken(tokenString string) string {
 	return sid
 }
 
+// EnterpriseRefresher re-reads the user's current enterprise session epoch
+// from the database while a session token is being re-signed. Renewing MUST
+// NOT copy ent_ver forward verbatim: sliding renewal would otherwise extend
+// a session whose enterprise authorization the platform has since revoked.
+// ok=false means the user no longer carries an enterprise identity — the
+// renewed token then drops the enterprise claims entirely.
+type EnterpriseRefresher func(userID string) (sid string, ver int64, ok bool)
+
 // RenewSessionToken re-signs the identity carried by claims with a fresh
 // lifetime, returning the new token and its expiry.
 //
@@ -205,12 +224,28 @@ func SessionIDFromToken(tokenString string) string {
 // the claims were signed by this server, so they are already authoritative
 // for exactly the fields the auth middleware reads back out.
 //
+// Enterprise claims are the exception: they are only carried forward when no
+// refresher is supplied (tests, non-DB contexts). Production renewal paths
+// pass RenewSessionTokenWithEnterprise's refresher so ent_ver is re-anchored
+// to the database on every re-sign.
+//
 // A pre-MUL-7436 token carries no `sid`. Renewal mints one, which is the
 // migration path for sessions that predate this code — and the one moment
 // where a CSRF token already read by another tab stops matching. It happens
 // once per legacy session, on a safe-method request; clients retry a CSRF
 // rejection once (packages/core/api/client.ts).
 func RenewSessionToken(claims jwt.MapClaims) (string, time.Time, error) {
+	return renewSessionToken(claims, nil)
+}
+
+// RenewSessionTokenWithEnterprise is RenewSessionToken with the enterprise
+// epoch refreshed from the database via refresh. See EnterpriseRefresher for
+// why the verbatim copy is not acceptable for ent_sid/ent_ver.
+func RenewSessionTokenWithEnterprise(claims jwt.MapClaims, refresh EnterpriseRefresher) (string, time.Time, error) {
+	return renewSessionToken(claims, refresh)
+}
+
+func renewSessionToken(claims jwt.MapClaims, refresh EnterpriseRefresher) (string, time.Time, error) {
 	sub, _ := claims["sub"].(string)
 	if sub == "" {
 		return "", time.Time{}, ErrNotSessionToken
@@ -232,6 +267,22 @@ func RenewSessionToken(claims jwt.MapClaims) (string, time.Time, error) {
 		}
 	}
 
+	// Enterprise claims: only tokens that already carry the epoch pay for a
+	// database refresh. A user whose enterprise identity is gone gets a plain
+	// session back; a live enterprise user gets the current session id +
+	// authorization version. Without a refresher (tests, non-DB contexts)
+	// the claims copy forward verbatim.
+	entSID, entVer := "", int64(0)
+	if oldSID, _ := claims[EnterpriseSessionClaim].(string); oldSID != "" {
+		if refresh != nil {
+			if newSID, newVer, ok := refresh(sub); ok {
+				entSID, entVer = newSID, newVer
+			}
+		} else if v, ok := claims[EnterpriseVersionClaim].(float64); ok {
+			entSID, entVer = oldSID, int64(v)
+		}
+	}
+
 	now := time.Now()
 	expiresAt := now.Add(AuthTokenTTL())
 	next := jwt.MapClaims{
@@ -245,6 +296,10 @@ func RenewSessionToken(claims jwt.MapClaims) (string, time.Time, error) {
 	}
 	if name, ok := claims["name"].(string); ok && name != "" {
 		next["name"] = name
+	}
+	if entSID != "" {
+		next[EnterpriseSessionClaim] = entSID
+		next[EnterpriseVersionClaim] = entVer
 	}
 
 	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, next).SignedString(JWTSecret())

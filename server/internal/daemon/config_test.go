@@ -1924,3 +1924,34 @@ func TestApplyOpenclawOverride_CLITimeout(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadConfig_EnterpriseManagedParametersReadEnv(t *testing.T) {
+	stageFakeAgent(t)
+	redirectTestHome(t, t.TempDir())
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "missing-shell"))
+	t.Setenv("MULTICA_ENTERPRISE_CLAUDE_PERMISSION_MODE", "")
+	t.Setenv("MULTICA_ENTERPRISE_CODEX_APPROVAL_POLICY", "")
+	base := Overrides{ServerURL: "http://localhost:0", WorkspacesRoot: t.TempDir()}
+
+	cfg, err := LoadConfig(base)
+	if err != nil {
+		t.Fatalf("LoadConfig default: %v", err)
+	}
+	if cfg.EnterpriseClaudePermissionMode != "" || cfg.EnterpriseCodexApprovalPolicy != "" {
+		t.Fatalf("enterprise managed parameters default to empty, got %q / %q",
+			cfg.EnterpriseClaudePermissionMode, cfg.EnterpriseCodexApprovalPolicy)
+	}
+
+	t.Setenv("MULTICA_ENTERPRISE_CLAUDE_PERMISSION_MODE", "plan")
+	t.Setenv("MULTICA_ENTERPRISE_CODEX_APPROVAL_POLICY", "on-failure")
+	cfg, err = LoadConfig(base)
+	if err != nil {
+		t.Fatalf("LoadConfig with enterprise managed parameters: %v", err)
+	}
+	if cfg.EnterpriseClaudePermissionMode != "plan" {
+		t.Fatalf("EnterpriseClaudePermissionMode = %q, want plan", cfg.EnterpriseClaudePermissionMode)
+	}
+	if cfg.EnterpriseCodexApprovalPolicy != "on-failure" {
+		t.Fatalf("EnterpriseCodexApprovalPolicy = %q, want on-failure", cfg.EnterpriseCodexApprovalPolicy)
+	}
+}

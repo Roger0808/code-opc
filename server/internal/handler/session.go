@@ -91,7 +91,7 @@ func (h *Handler) RefreshSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newToken, newExpiresAt, err := auth.RenewSessionToken(claims)
+	newToken, newExpiresAt, err := auth.RenewSessionTokenWithEnterprise(claims, h.enterpriseRefresher())
 	if err != nil {
 		if errors.Is(err, auth.ErrTemporarilyDisabledUser) {
 			writeError(w, http.StatusForbidden, auth.TemporarilyDisabledUserError)

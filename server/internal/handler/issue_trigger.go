@@ -82,7 +82,19 @@ func (h *Handler) shouldSuppressActiveSelfAssignment(ctx context.Context, actorT
 // clients and travels only with a run that actually starts. The squad path
 // still flows through enqueueSquadLeaderTask so the leader access gate and
 // pending dedup stay in one place.
-func (h *Handler) dispatchIssueRun(ctx context.Context, issue db.Issue, trigger service.IssueRunTrigger, actorType, actorID, handoffNote string) {
+// dispatchIssueRun enqueues the run an issue write triggered. It returns an
+// error only when the dispatch is forbidden — currently when an enterprise
+// workspace would start a run for an initiator who is not an authenticated
+// enterprise user (TASK-C02.5). Callers answer that with a 403; a nil error
+// means the task was enqueued (or legitimately needed no enqueue).
+func (h *Handler) dispatchIssueRun(ctx context.Context, issue db.Issue, trigger service.IssueRunTrigger, actorType, actorID, handoffNote string) error {
+	// The enterprise gate runs before any enqueue: in an enterprise workspace
+	// only a human actor holding a live enterprise identity may start work,
+	// so a personal member or a machine credential gets a refusal instead of
+	// a run the platform cannot attribute.
+	if err := h.enterpriseInitiatorGate(ctx, actorType, actorID, issue.WorkspaceID); err != nil {
+		return err
+	}
 	switch trigger.AssigneeType {
 	case "agent":
 		// The member who performed this assign/promote is the accountable human
@@ -92,6 +104,7 @@ func (h *Handler) dispatchIssueRun(ctx context.Context, issue db.Issue, trigger 
 	case "squad":
 		h.enqueueSquadLeaderTask(ctx, issue, pgtype.UUID{}, actorType, actorID, handoffNote)
 	}
+	return nil
 }
 
 // memberActorUserID returns the acting member's user id as a pgtype.UUID when the

@@ -129,6 +129,16 @@ func memberRemovalCandidate(raw []byte) bool {
 
 func (h *Hub) stopClient(client *Client, notice []byte, deadline time.Time) {
 	client.stopped.Store(true)
+	// Write the final notice BEFORE removeClient can signal the writePump:
+	// removal closes the send queue, and an idle writePump then returns and
+	// runs its deferred conn.Close underneath any later notice write. A busy
+	// writer (writeMu held) still skips the notice — the "close busy/slow
+	// writers immediately" semantics are unchanged.
+	if client.conn != nil && len(notice) != 0 && time.Now().Before(deadline) && client.writeMu.TryLock() {
+		client.conn.SetWriteDeadline(deadline)
+		_ = client.conn.WriteMessage(websocket.TextMessage, notice)
+		client.writeMu.Unlock()
+	}
 	h.removeClient(client)
 	client.closeSend() // a writer may stop before registration completes
 	for range client.send {
@@ -137,11 +147,6 @@ func (h *Hub) stopClient(client *Client, notice []byte, deadline time.Time) {
 	}
 	if client.conn == nil {
 		return
-	}
-	if len(notice) != 0 && time.Now().Before(deadline) && client.writeMu.TryLock() {
-		client.conn.SetWriteDeadline(deadline)
-		_ = client.conn.WriteMessage(websocket.TextMessage, notice)
-		client.writeMu.Unlock()
 	}
 	client.conn.Close()
 }

@@ -158,6 +158,14 @@ func isSixDigitCode(code string) bool {
 }
 
 func (h *Handler) issueJWT(user db.User) (string, error) {
+	return h.issueJWTWithEnterprise(user, "", 0)
+}
+
+// issueJWTWithEnterprise signs a session JWT and, when entSID is non-empty,
+// stamps the enterprise session epoch (ent_sid + ent_ver) into the claims.
+// The exchange flow is the only producer of enterprise claims; ent_ver MUST
+// be the version just read from the user row, not a client-supplied value.
+func (h *Handler) issueJWTWithEnterprise(user db.User, entSID string, entVer int64) (string, error) {
 	if auth.IsTemporarilyDisabledUser(uuidToString(user.ID), user.Email) {
 		return "", auth.ErrTemporarilyDisabledUser
 	}
@@ -170,14 +178,19 @@ func (h *Handler) issueJWT(user db.User) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	claims := jwt.MapClaims{
 		"sub":   uuidToString(user.ID),
 		"email": user.Email,
 		"name":  user.Name,
 		"sid":   sid,
 		"exp":   time.Now().Add(auth.AuthTokenTTL()).Unix(),
 		"iat":   time.Now().Unix(),
-	})
+	}
+	if entSID != "" {
+		claims[auth.EnterpriseSessionClaim] = entSID
+		claims[auth.EnterpriseVersionClaim] = entVer
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(auth.JWTSecret())
 }
 

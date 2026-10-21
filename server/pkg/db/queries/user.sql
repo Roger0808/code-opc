@@ -73,3 +73,40 @@ UPDATE "user" SET
     updated_at = now()
 WHERE id = $1
 RETURNING *;
+
+-- name: GetUserByEnterpriseSubject :one
+-- Enterprise identity lookup for the code-exchange flow: the platform subject
+-- is the stable key; the local email is only a placeholder.
+SELECT * FROM "user"
+WHERE enterprise_subject = $1;
+
+-- name: CreateEnterpriseUser :one
+-- Creates a locally-managed user row for a platform (enterprise) identity.
+-- The email is an internal placeholder, not a deliverable mailbox.
+INSERT INTO "user" (name, email, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING *;
+
+-- name: UpdateUserEnterpriseIdentity :one
+-- Refreshes the platform identity binding on a subsequent exchange: a new
+-- session epoch is minted per exchange and the authorization version is
+-- re-anchored to whatever the platform currently reports.
+UPDATE "user" SET
+    enterprise_subject = COALESCE($2, enterprise_subject),
+    enterprise_identity_link_id = COALESCE($3, enterprise_identity_link_id),
+    enterprise_authz_version = COALESCE($4, enterprise_authz_version),
+    enterprise_session_id = COALESCE($5, enterprise_session_id),
+    updated_at = now()
+WHERE id = $1
+RETURNING *;
+
+-- name: UpdateUserEnterpriseAuthzVersion :execrows
+-- Re-anchors a user's enterprise authorization version from the platform
+-- (revocation propagation path; see EnterpriseVersion middleware refresher).
+-- Monotonic: a stale platform read (or a replayed invalidate frame) carrying
+-- an older version must never roll the row back, so the write only lands when
+-- it moves the version forward. Callers read the row back when they need the
+-- winning value.
+UPDATE "user" SET enterprise_authz_version = $2, updated_at = now()
+WHERE id = $1 AND enterprise_subject IS NOT NULL
+  AND (enterprise_authz_version IS NULL OR enterprise_authz_version < $2);

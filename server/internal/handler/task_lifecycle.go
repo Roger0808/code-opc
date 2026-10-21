@@ -208,6 +208,13 @@ func (h *Handler) RerunIssue(w http.ResponseWriter, r *http.Request) {
 		return h.canInvokeAgent(r.Context(), agent, actorType, actorID, originatorUserID, workspaceID)
 	}
 
+	// Enterprise workspace: a rerun enqueues a new enterprise task, so the
+	// rerunning member must be an enterprise-authenticated human (TASK-C02.5).
+	if err := h.enterpriseInitiatorGateHTTP(r, actorType, actorID, issue.WorkspaceID); err != nil {
+		writeEnterpriseInitiatorRefusal(w)
+		return
+	}
+
 	task, err := h.TaskService.RerunIssue(r.Context(), issue.ID, sourceTaskID, pgtype.UUID{}, actorUserID, canInvoke)
 	if errors.Is(err, service.ErrRerunInvokeNotAllowed) {
 		h.writeDispatchBlocked(w, http.StatusForbidden, ReasonInvocationNotAllowed)
@@ -253,6 +260,12 @@ func (h *Handler) RetrySourceContextQuickCreate(w http.ResponseWriter, r *http.R
 	}
 	canInvoke := func(agent db.Agent) bool {
 		return h.canInvokeAgent(r.Context(), agent, "member", userID, userID, uuidToString(workspaceID))
+	}
+	// Enterprise workspace: the retry enqueues an enterprise task, so the
+	// requester must be an enterprise-authenticated human (TASK-C02.5).
+	if err := h.enterpriseInitiatorGateHTTP(r, "member", userID, workspaceID); err != nil {
+		writeEnterpriseInitiatorRefusal(w)
+		return
 	}
 	task, err := h.TaskService.RetrySourceContextQuickCreate(r.Context(), workspaceID, requesterID, taskID, canInvoke)
 	if writeIssueLimitReached(w, err) {

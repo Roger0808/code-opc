@@ -17,6 +17,10 @@ import type {
   LocalRuntimeProbe,
 } from "../shared/daemon-types";
 import type { TabSelectionShortcutKey } from "../shared/main-renderer-messages";
+import type {
+  EnterpriseAuthBeginResult,
+  EnterpriseCallbackPayload,
+} from "../shared/enterprise";
 
 interface DesktopAPI {
   /** App version + normalized OS, captured synchronously at preload time. */
@@ -136,7 +140,16 @@ interface DaemonAPI {
   getHostName: () => Promise<string>;
   onStatusChange: (callback: (status: DaemonStatus) => void) => () => void;
   setTargetApiUrl: (url: string) => Promise<void>;
-  syncToken: (token: string, userId: string) => Promise<void>;
+  /**
+   * Sync the daemon profile's token. Enterprise sessions pass
+   * `sessionKind: "enterprise"` so no PAT is minted or written — enterprise
+   * daemon claims authenticate through platform task leases instead.
+   */
+  syncToken: (
+    token: string,
+    userId: string,
+    sessionKind?: "personal" | "enterprise",
+  ) => Promise<void>;
   clearToken: () => Promise<void>;
   reauthenticate: (
     token: string,
@@ -166,11 +179,36 @@ interface UpdaterAPI {
   checkForUpdates: () => Promise<ManualUpdateCheckResult>;
 }
 
+interface EnterpriseAPI {
+  /** Open the loopback callback listener; returns its port and one-time state. */
+  beginAuth: () => Promise<EnterpriseAuthBeginResult>;
+  /** Abandon the pending loopback attempt. */
+  cancelAuth: () => Promise<void>;
+  /** Subscribe to the loopback callback pushed by main. Returns an unsubscribe function. */
+  onAuthCallback: (
+    callback: (payload: EnterpriseCallbackPayload) => void,
+  ) => () => void;
+  /** Seal an enterprise credential into the main-process safeStorage vault. */
+  seal: (profile: string, plaintext: string) => Promise<void>;
+  /** Open a sealed enterprise credential; null when none exists. */
+  open: (profile: string) => Promise<string | null>;
+  /** Remove a sealed enterprise credential, if present. */
+  delete: (profile: string) => Promise<void>;
+  /** Whether a sealed credential exists for the profile. */
+  has: (profile: string) => Promise<boolean>;
+  /**
+   * Boot-time restore: synchronously read the sealed enterprise session
+   * token, or null when there is none.
+   */
+  restoreSession: () => string | null;
+}
+
 declare global {
   interface Window {
     electron: ElectronAPI;
     desktopAPI: DesktopAPI;
     daemonAPI: DaemonAPI;
+    enterpriseAPI: EnterpriseAPI;
     updater: UpdaterAPI;
   }
 }

@@ -1233,6 +1233,13 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.DeleteWorkspaceLeafData(ctx, requester.WorkspaceID) },
 		},
 		{
+			// enterprise_workspace_link carries no foreign key by project
+			// rule; without this sweep a deleted workspace would still read
+			// as enterprise-managed on any later daemon claim path.
+			name: "delete enterprise workspace links",
+			run:  func() error { return qtx.DeleteEnterpriseWorkspaceLinksByWorkspace(ctx, requester.WorkspaceID) },
+		},
+		{
 			name: "delete autopilot runs",
 			run:  func() error { return qtx.DeleteWorkspaceAutopilotRuns(ctx, requester.WorkspaceID) },
 		},

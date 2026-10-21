@@ -58,6 +58,47 @@ describe("runtime config", () => {
     });
   });
 
+  it("omits platformUrl when the deployment has not configured one", () => {
+    const config = parseRuntimeConfig(
+      JSON.stringify({
+        schemaVersion: 1,
+        apiUrl: "https://api.example.com/",
+      }),
+    );
+    expect(config).not.toHaveProperty("platformUrl");
+  });
+
+  it("accepts and normalizes an optional platformUrl", () => {
+    const config = parseRuntimeConfig(
+      JSON.stringify({
+        schemaVersion: 1,
+        apiUrl: "https://api.example.com/",
+        platformUrl: "https://platform.example.com/",
+      }),
+    );
+    expect(config.platformUrl).toBe("https://platform.example.com");
+  });
+
+  it("rejects a non-http platformUrl", () => {
+    expect(() =>
+      parseRuntimeConfig(
+        JSON.stringify({
+          schemaVersion: 1,
+          apiUrl: "https://api.example.com/",
+          platformUrl: "ftp://platform.example.com",
+        }),
+      ),
+    ).toThrow(/platformUrl must use http or https/);
+  });
+
+  it("reads platformUrl from the dev environment", () => {
+    const config = runtimeConfigFromDevEnv({
+      apiUrl: "http://localhost:8080",
+      platformUrl: "http://localhost:9100/",
+    });
+    expect(config.platformUrl).toBe("http://localhost:9100");
+  });
+
   it("rejects invalid JSON", () => {
     expect(() => parseRuntimeConfig("{")).toThrow(/Invalid desktop runtime config JSON/);
   });

@@ -1149,7 +1149,14 @@ type hermesClient struct {
 	// permission policy. Reasonix uses this to reject user questions and
 	// fresh-human approvals that also happen to carry allow_once options.
 	// Nil preserves the shared ACP policy for existing backends.
+	// Ignored for enterprise tasks, where selectEnterpriseACPRejectOnly is
+	// forced instead (BND-162).
 	selectPermission func(json.RawMessage) (optionID string, grant bool, ok bool)
+	// enterprise marks a task dispatched under the enterprise protocol
+	// (BND-162): permission requests may only be denied (reject_once), never
+	// auto-granted. Set by backends whose task claims the enterprise marker;
+	// false keeps the historical headless policy.
+	enterprise bool
 	// onNotification observes vendor notifications that are not session/update.
 	// Existing backends leave it nil; the callback must do its own method and
 	// lifecycle filtering.
@@ -1428,7 +1435,15 @@ func (c *hermesClient) handleAgentRequest(raw map[string]json.RawMessage) {
 		}
 		resp = map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(rawID), "result": result}
 	case "session/request_permission":
+		// BND-162: enterprise tasks never auto-grant. The enterprise selector
+		// only ever picks an offered reject_once — overriding any dialect
+		// selector — so allow_once / allow_always / session-grant options
+		// cannot be auto-selected for a managed task. With no reject_once
+		// offered it fails closed into the protocol-error branch below.
 		selector := c.selectPermission
+		if c.enterprise {
+			selector = selectEnterpriseACPRejectOnly
+		}
 		if selector == nil {
 			selector = selectACPPermissionOption
 		}
@@ -1589,6 +1604,28 @@ func selectACPPermissionOption(params json.RawMessage) (optionID string, grant b
 	}
 	// 4. Nothing safely selectable (empty, malformed, permanent-only, or
 	//    reject_always-only). Signal the caller to return a protocol error.
+	return "", false, false
+}
+
+// selectEnterpriseACPRejectOnly is the BND-162 enterprise permission policy:
+// it selects an offered reject_once (deny this action) and nothing else —
+// no session-scoped grant, no allow_once, no allow_always. ok=false when the
+// request offers no reject_once, in which case the caller fails closed with
+// a protocol error instead of fabricating an outcome.
+func selectEnterpriseACPRejectOnly(params json.RawMessage) (optionID string, grant bool, ok bool) {
+	var p struct {
+		Options []acpPermissionOption `json:"options"`
+	}
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &p); err != nil {
+			return "", false, false
+		}
+	}
+	for _, opt := range p.Options {
+		if opt.OptionID != "" && strings.EqualFold(strings.TrimSpace(opt.Kind), acpKindRejectOnce) {
+			return opt.OptionID, false, true
+		}
+	}
 	return "", false, false
 }
 

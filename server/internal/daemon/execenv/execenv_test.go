@@ -4275,7 +4275,7 @@ func TestPrepareCodexHomeFailsClosedWhenSandboxWriteFails(t *testing.T) {
 		_ = os.Chmod(configPath, 0o644)
 	})
 
-	err := prepareCodexHomeWithOpts(codexHome, CodexHomeOptions{GOOS: "windows", CodexVersion: "0.144.5"}, testLogger())
+	_, err := prepareCodexHomeWithOpts(codexHome, CodexHomeOptions{GOOS: "windows", CodexVersion: "0.144.5"}, testLogger())
 	if err == nil {
 		t.Fatal("expected prepareCodexHomeWithOpts to fail closed when the sandbox block cannot be written, got nil")
 	}
