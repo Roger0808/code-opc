@@ -30,6 +30,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
+	"github.com/multica-ai/multica/server/internal/enterprise"
 	"github.com/multica-ai/multica/server/internal/selfexec"
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/agent"
@@ -5785,6 +5786,16 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		}
 	}()
 
+	// Enterprise lease renewal (TASK-C02 / BND-110): the claim-issued
+	// platform lease has a 30s TTL. Renew it every enterpriseLeaseRenewInterval
+	// for the life of the task; a terminal refusal or an unrenewed expiry
+	// cancels the run fail-closed so no new cloud calls happen without a
+	// live lease. Personal tasks get a nil renewer and no loop.
+	leaseRenewer := d.startEnterpriseLeaseRenewal(task, runCancel, taskLog)
+	if leaseRenewer != nil {
+		defer leaseRenewer.stop()
+	}
+
 	result, err := d.runner.run(runCtx, task, provider, slot, taskLog)
 	if errors.Is(err, errStartClaimRejected) {
 		// The row belongs to another claim (or is terminal). A task-id-only
@@ -5802,6 +5813,26 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		if usageErr := d.client.ReportTaskUsage(ctx, task.ID, result.Usage); usageErr != nil {
 			taskLog.Warn("report task usage failed", "error", usageErr)
 		}
+	}
+
+	// Lease loss takes the run down fail-closed: the renewal loop cancelled
+	// runCtx, so runner.run has just returned (most likely with a
+	// killed-process error). Report the real reason — the run died because
+	// its platform authorization did, not because the agent misbehaved.
+	if leaseRenewer != nil && leaseRenewer.lost() != nil {
+		taskLog.Warn("enterprise task stopped: lease lost", "error", leaseRenewer.lost())
+		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
+			kind:           terminalTaskReportFail,
+			taskID:         task.ID,
+			errorMessage:   "enterprise lease lost: " + leaseRenewer.lost().Error(),
+			branchName:     result.BranchName,
+			workDir:        result.WorkDir,
+			durableWorkDir: result.DurableWorkDir,
+			failureReason:  taskfailure.ReasonEnterpriseLeaseLost.String(),
+		}); failErr != nil {
+			taskLog.Error("fail task callback failed", "error", failErr)
+		}
+		return
 	}
 
 	// Check if we were cancelled by the polling goroutine.
@@ -6922,12 +6953,23 @@ func waitCodexRolloutPresent(ctx context.Context, codexHome, sessionID string) b
 }
 
 func (d *Daemon) ensureTaskSkillBundles(ctx context.Context, task *Task) error {
-	if task == nil || task.Agent == nil || len(task.Agent.SkillRefs) == 0 {
+	if task == nil || task.Agent == nil {
 		return nil
 	}
-	resolved := make(map[string]SkillData, len(task.Agent.SkillRefs))
+	// TASK-C06: the claim hands enterprise tasks their platform-published
+	// skills separately from agent skill refs (enterprise_skills). They are
+	// pinned source-"enterprise" refs, so folding them into the resolve set
+	// here sends each through the server-side pinned-version resolver with
+	// the failed-closed semantics below. Personal tasks never carry them
+	// and old servers never send the field, so both keep the historical
+	// behavior untouched.
+	skillRefs := withEnterpriseSkillRefs(task.Agent.SkillRefs, task.EnterpriseSkills)
+	if len(skillRefs) == 0 {
+		return nil
+	}
+	resolved := make(map[string]SkillData, len(skillRefs))
 	misses := make([]SkillRefData, 0)
-	for _, ref := range task.Agent.SkillRefs {
+	for _, ref := range skillRefs {
 		ref := ref
 		var bundle SkillData
 		if err := d.skillCache.WithRefLock(task.WorkspaceID, ref, func() error {
@@ -6953,10 +6995,27 @@ func (d *Daemon) ensureTaskSkillBundles(ctx context.Context, task *Task) error {
 	// size-scaled deadline and is persisted independently, so even a dispatch
 	// that ultimately fails leaves the skills it did fetch cached for the next
 	// one. (GitHub #4505 / MUL-3650)
+	var unavailable []SkillRefData
 	for _, ref := range misses {
 		started := time.Now()
 		bundle, stats, err := d.resolveSkillBundle(ctx, task, ref)
 		if err != nil {
+			if task.Enterprise && ref.Source == enterprise.Source {
+				// BND-142 failed-closed: a platform skill whose pinned
+				// revision is gone or whose manifest rejects local install
+				// must not take the enterprise task down with it. The server
+				// has already recorded the per-skill status; the daemon
+				// drops the skill and the rest of the task continues.
+				// Personal tasks never carry enterprise refs (the claim
+				// only emits them for enterprise workspaces), so they keep
+				// the historical whole-task failure below.
+				if d.logger != nil {
+					d.logger.Warn("enterprise skill unavailable; continuing without it",
+						"task_id", task.ID, "publish_id", ref.ID, "hash", ref.Hash, "error", err)
+				}
+				unavailable = append(unavailable, ref)
+				continue
+			}
 			if isSkillBundleTransferFailure(err) {
 				// Only transport failures and incomplete 2xx bodies get the
 				// network diagnosis. HTTP error responses and invalid complete
@@ -6972,16 +7031,57 @@ func (d *Daemon) ensureTaskSkillBundles(ctx context.Context, task *Task) error {
 		resolved[skillRefKey(bundle.Source, bundle.ID)] = bundle
 	}
 
-	skills := make([]SkillData, 0, len(task.Agent.SkillRefs))
-	for _, ref := range task.Agent.SkillRefs {
+	skills := make([]SkillData, 0, len(skillRefs))
+	for _, ref := range skillRefs {
 		bundle, ok := resolved[skillRefKey(ref.Source, ref.ID)]
 		if !ok {
+			if task.Enterprise && ref.Source == enterprise.Source && containsSkillRef(unavailable, ref) {
+				// Failed-closed enterprise skill: omitted from the run's
+				// skills, task continues with the rest.
+				continue
+			}
 			return fmt.Errorf("skill bundle missing after resolve: skill_id=%s source=%s hash=%s", ref.ID, ref.Source, ref.Hash)
 		}
 		skills = append(skills, bundle)
 	}
 	task.Agent.Skills = skills
 	return nil
+}
+
+func containsSkillRef(refs []SkillRefData, want SkillRefData) bool {
+	for _, ref := range refs {
+		if ref.Source == want.Source && ref.ID == want.ID && ref.Hash == want.Hash {
+			return true
+		}
+	}
+	return false
+}
+
+// withEnterpriseSkillRefs folds the claim-issued enterprise_skills into the
+// refs to resolve for one task. Entries are already pinned source-
+// "enterprise" refs, so they travel the server-side pinned-version
+// resolver with the task's other refs; malformed entries and anything not
+// carrying the enterprise source marker are ignored. Agent skill refs can
+// never collide with them: workspace, builtin and plugin are the only
+// sources the agent bundle builder emits.
+func withEnterpriseSkillRefs(refs []SkillRefData, enterpriseSkills []EnterpriseSkillRefData) []SkillRefData {
+	if len(enterpriseSkills) == 0 {
+		return refs
+	}
+	out := make([]SkillRefData, 0, len(refs)+len(enterpriseSkills))
+	out = append(out, refs...)
+	for _, ref := range enterpriseSkills {
+		if ref.Source != enterprise.Source || strings.TrimSpace(ref.ID) == "" || strings.TrimSpace(ref.Hash) == "" {
+			continue
+		}
+		out = append(out, SkillRefData{
+			ID:     ref.ID,
+			Source: ref.Source,
+			Name:   ref.Name,
+			Hash:   ref.Hash,
+		})
+	}
+	return out
 }
 
 // resolveSkillBundle downloads one skill bundle and writes it to the on-disk
@@ -7937,7 +8037,15 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if task.Agent != nil {
 		agentMcpConfig = task.Agent.McpConfig
 		effectiveMcpConfig = agentMcpConfig
-		if merged, mergeErr := mergeRuntimeAndAgentMcpConfig(provider, agentMcpConfig); mergeErr != nil {
+		if task.Enterprise {
+			// Enterprise tasks (BND-161): never merge machine-local MCP
+			// configuration. The managed set from the claim response is the
+			// entire tool surface — including the legal empty set — and a
+			// failed-closed marker keeps the daemon from inheriting personal
+			// servers (and their credentials) for enterprise work.
+			taskLog.Info("enterprise task: skipping local MCP merge, using managed set only",
+				"managed_mcp_status", task.ManagedMcpStatus)
+		} else if merged, mergeErr := mergeRuntimeAndAgentMcpConfig(provider, agentMcpConfig); mergeErr != nil {
 			taskLog.Warn("mcp_config: runtime merge failed; using agent configuration only",
 				"provider", provider,
 				"error", mergeErr,
@@ -8699,16 +8807,20 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// only the daemon knows — hence handing the backend finished text rather
 		// than a flag. Empty when the prompt already carries the notice, so a turn
 		// can never pay for it twice (MUL-5722).
-		ResumeExpected:         task.PriorSessionID != "",
-		ResumeContinuityNotice: backendResumeContinuityNotice(task),
-		ExtraArgs:              extraArgs,
-		CustomArgs:             customArgs,
-		McpConfig:              mcpConfig,
-		ThinkingLevel:          thinkingLevel,
-		ServiceTier:            serviceTier,
-		OpenclawMode:           openclawMode,
-		ClaudeSettingsPath:     env.ClaudeSettingsPath,
-		QwenpawWorkspace:       env.QwenpawWorkspace,
+		ResumeExpected:                 task.PriorSessionID != "",
+		ResumeContinuityNotice:         backendResumeContinuityNotice(task),
+		ExtraArgs:                      extraArgs,
+		CustomArgs:                     customArgs,
+		McpConfig:                      mcpConfig,
+		ThinkingLevel:                  thinkingLevel,
+		ServiceTier:                    serviceTier,
+		OpenclawMode:                   openclawMode,
+		ClaudeSettingsPath:             env.ClaudeSettingsPath,
+		QwenpawWorkspace:               env.QwenpawWorkspace,
+		Enterprise:                     task.Enterprise,
+		EnterpriseClaudePermissionMode: d.cfg.EnterpriseClaudePermissionMode,
+		EnterpriseCodexApprovalPolicy:  d.cfg.EnterpriseCodexApprovalPolicy,
+		CodexSandboxMode:               env.CodexSandboxMode,
 	}
 	// Some providers do not reliably load the per-task runtime config files we
 	// write into the task workdir:

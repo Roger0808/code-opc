@@ -86,7 +86,7 @@ func claimRun(t *testing.T, taskID string, rendersJoined bool) string {
 	if rendersJoined {
 		req.Header.Set("X-Client-Capabilities", protocol.DaemonCapabilityJoinedWakeupsV1)
 	}
-	resp, _, _, _, _, failure := testHandler.buildClaimedTaskResponse(req, &task, runtime, uuidToString(task.RuntimeID), testWorkspaceID)
+	resp, _, _, _, _, failure := testHandler.buildClaimedTaskResponse(req, &task, runtime, uuidToString(task.RuntimeID), testWorkspaceID, false)
 	if failure != nil {
 		t.Fatalf("claim: %+v", failure)
 	}

@@ -8,6 +8,8 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/util"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 type sessionRenewedCtxKey struct{}
@@ -19,6 +21,29 @@ type sessionRenewedCtxKey struct{}
 func SessionRenewed(r *http.Request) bool {
 	renewed, _ := r.Context().Value(sessionRenewedCtxKey{}).(bool)
 	return renewed
+}
+
+// enterpriseRefresher builds the EnterpriseRefresher that re-anchors ent_sid
+// and ent_ver to the database while a session cookie is being re-signed.
+// Renewal must never copy the enterprise claims forward verbatim: the whole
+// point of the session epoch is that a revoked authorization stops extending.
+// A user whose enterprise identity is gone (NULL subject) renews into a
+// plain personal session.
+func enterpriseRefresher(queries *db.Queries) auth.EnterpriseRefresher {
+	if queries == nil {
+		return nil
+	}
+	return func(userID string) (string, int64, bool) {
+		userUUID, err := util.ParseUUID(userID)
+		if err != nil {
+			return "", 0, false
+		}
+		user, err := queries.GetUser(context.Background(), userUUID)
+		if err != nil || !user.EnterpriseSubject.Valid {
+			return "", 0, false
+		}
+		return user.EnterpriseSessionID.String, user.EnterpriseAuthzVersion.Int64, true
+	}
 }
 
 // renewCookieSession re-issues the browser's auth cookie when the session
@@ -43,7 +68,7 @@ func SessionRenewed(r *http.Request) bool {
 // Every failure below is non-fatal and silent to the caller: the session that
 // authenticated this request is still valid for at least another TTL/2, so a
 // failed renewal costs one more chance at it, not the session.
-func renewCookieSession(w http.ResponseWriter, r *http.Request, claims jwt.MapClaims, fromCookie bool, cfSigner *auth.CloudFrontSigner) *http.Request {
+func renewCookieSession(w http.ResponseWriter, r *http.Request, claims jwt.MapClaims, fromCookie bool, cfSigner *auth.CloudFrontSigner, refresh auth.EnterpriseRefresher) *http.Request {
 	if !fromCookie || !auth.IsSafeMethod(r.Method) {
 		return r
 	}
@@ -51,7 +76,7 @@ func renewCookieSession(w http.ResponseWriter, r *http.Request, claims jwt.MapCl
 		return r
 	}
 
-	token, expiresAt, err := auth.RenewSessionToken(claims)
+	token, expiresAt, err := auth.RenewSessionTokenWithEnterprise(claims, refresh)
 	if err != nil {
 		slog.Debug("auth: session renewal skipped", "path", r.URL.Path, "error", err)
 		return r

@@ -11,10 +11,60 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const createEnterpriseUser = `-- name: CreateEnterpriseUser :one
+INSERT INTO "user" (name, email, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id
+`
+
+type CreateEnterpriseUserParams struct {
+	Name                     string      `json:"name"`
+	Email                    string      `json:"email"`
+	EnterpriseSubject        pgtype.Text `json:"enterprise_subject"`
+	EnterpriseIdentityLinkID pgtype.Text `json:"enterprise_identity_link_id"`
+	EnterpriseAuthzVersion   pgtype.Int8 `json:"enterprise_authz_version"`
+	EnterpriseSessionID      pgtype.Text `json:"enterprise_session_id"`
+}
+
+// Creates a locally-managed user row for a platform (enterprise) identity.
+// The email is an internal placeholder, not a deliverable mailbox.
+func (q *Queries) CreateEnterpriseUser(ctx context.Context, arg CreateEnterpriseUserParams) (User, error) {
+	row := q.db.QueryRow(ctx, createEnterpriseUser,
+		arg.Name,
+		arg.Email,
+		arg.EnterpriseSubject,
+		arg.EnterpriseIdentityLinkID,
+		arg.EnterpriseAuthzVersion,
+		arg.EnterpriseSessionID,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Email,
+		&i.AvatarUrl,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OnboardedAt,
+		&i.OnboardingQuestionnaire,
+		&i.CloudWaitlistEmail,
+		&i.CloudWaitlistReason,
+		&i.StarterContentState,
+		&i.Language,
+		&i.ProfileDescription,
+		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
+	)
+	return i, err
+}
+
 const createUser = `-- name: CreateUser :one
 INSERT INTO "user" (name, email, avatar_url)
 VALUES ($1, $2, $3)
-RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone
+RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id
 `
 
 type CreateUserParams struct {
@@ -41,12 +91,16 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.Language,
 		&i.ProfileDescription,
 		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
 	)
 	return i, err
 }
 
 const getUser = `-- name: GetUser :one
-SELECT id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone FROM "user"
+SELECT id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id FROM "user"
 WHERE id = $1
 `
 
@@ -68,12 +122,16 @@ func (q *Queries) GetUser(ctx context.Context, id pgtype.UUID) (User, error) {
 		&i.Language,
 		&i.ProfileDescription,
 		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone FROM "user"
+SELECT id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id FROM "user"
 WHERE email = $1
 `
 
@@ -95,6 +153,43 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.Language,
 		&i.ProfileDescription,
 		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
+	)
+	return i, err
+}
+
+const getUserByEnterpriseSubject = `-- name: GetUserByEnterpriseSubject :one
+SELECT id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id FROM "user"
+WHERE enterprise_subject = $1
+`
+
+// Enterprise identity lookup for the code-exchange flow: the platform subject
+// is the stable key; the local email is only a placeholder.
+func (q *Queries) GetUserByEnterpriseSubject(ctx context.Context, enterpriseSubject pgtype.Text) (User, error) {
+	row := q.db.QueryRow(ctx, getUserByEnterpriseSubject, enterpriseSubject)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Email,
+		&i.AvatarUrl,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OnboardedAt,
+		&i.OnboardingQuestionnaire,
+		&i.CloudWaitlistEmail,
+		&i.CloudWaitlistReason,
+		&i.StarterContentState,
+		&i.Language,
+		&i.ProfileDescription,
+		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
 	)
 	return i, err
 }
@@ -145,7 +240,7 @@ UPDATE "user" SET
     cloud_waitlist_reason = $3,
     updated_at = now()
 WHERE id = $1
-RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone
+RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id
 `
 
 type JoinCloudWaitlistParams struct {
@@ -175,6 +270,10 @@ func (q *Queries) JoinCloudWaitlist(ctx context.Context, arg JoinCloudWaitlistPa
 		&i.Language,
 		&i.ProfileDescription,
 		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
 	)
 	return i, err
 }
@@ -184,7 +283,7 @@ UPDATE "user" SET
     onboarded_at = COALESCE(onboarded_at, now()),
     updated_at = now()
 WHERE id = $1
-RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone
+RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id
 `
 
 func (q *Queries) MarkUserOnboarded(ctx context.Context, id pgtype.UUID) (User, error) {
@@ -205,6 +304,10 @@ func (q *Queries) MarkUserOnboarded(ctx context.Context, id pgtype.UUID) (User, 
 		&i.Language,
 		&i.ProfileDescription,
 		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
 	)
 	return i, err
 }
@@ -214,7 +317,7 @@ UPDATE "user" SET
     onboarding_questionnaire = COALESCE($1, onboarding_questionnaire),
     updated_at = now()
 WHERE id = $2
-RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone
+RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id
 `
 
 type PatchUserOnboardingParams struct {
@@ -244,6 +347,10 @@ func (q *Queries) PatchUserOnboarding(ctx context.Context, arg PatchUserOnboardi
 		&i.Language,
 		&i.ProfileDescription,
 		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
 	)
 	return i, err
 }
@@ -261,7 +368,7 @@ UPDATE "user" SET
     END,
     updated_at = now()
 WHERE id = $1
-RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone
+RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id
 `
 
 type UpdateUserParams struct {
@@ -310,6 +417,98 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 		&i.Language,
 		&i.ProfileDescription,
 		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
+	)
+	return i, err
+}
+
+const updateUserEnterpriseAuthzVersion = `-- name: UpdateUserEnterpriseAuthzVersion :execrows
+UPDATE "user" SET enterprise_authz_version = $2, updated_at = now()
+WHERE id = $1 AND enterprise_subject IS NOT NULL
+  AND (enterprise_authz_version IS NULL OR enterprise_authz_version < $2)
+`
+
+type UpdateUserEnterpriseAuthzVersionParams struct {
+	ID                     pgtype.UUID `json:"id"`
+	EnterpriseAuthzVersion pgtype.Int8 `json:"enterprise_authz_version"`
+}
+
+// Re-anchors a user's enterprise authorization version from the platform
+// (revocation propagation path; see EnterpriseVersion middleware refresher).
+// Monotonic: a stale platform read (or a replayed invalidate frame) carrying
+// an older version must never roll the row back, so the write only lands when
+// it moves the version forward. Callers read the row back when they need the
+// winning value.
+func (q *Queries) UpdateUserEnterpriseAuthzVersion(ctx context.Context, arg UpdateUserEnterpriseAuthzVersionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateUserEnterpriseAuthzVersion, arg.ID, arg.EnterpriseAuthzVersion)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateUserEnterpriseIdentity = `-- name: UpdateUserEnterpriseIdentity :one
+UPDATE "user" SET
+    enterprise_subject = COALESCE($2, enterprise_subject),
+    enterprise_identity_link_id = COALESCE($3, enterprise_identity_link_id),
+    enterprise_authz_version = COALESCE($4, enterprise_authz_version),
+    enterprise_session_id = COALESCE($5, enterprise_session_id),
+    name = COALESCE(NULLIF($6::text, ''), name),
+    email = COALESCE(NULLIF($7::text, ''), email),
+    updated_at = now()
+WHERE id = $1
+RETURNING id, name, email, avatar_url, created_at, updated_at, onboarded_at, onboarding_questionnaire, cloud_waitlist_email, cloud_waitlist_reason, starter_content_state, language, profile_description, timezone, enterprise_subject, enterprise_identity_link_id, enterprise_authz_version, enterprise_session_id
+`
+
+type UpdateUserEnterpriseIdentityParams struct {
+	ID                       pgtype.UUID `json:"id"`
+	EnterpriseSubject        pgtype.Text `json:"enterprise_subject"`
+	EnterpriseIdentityLinkID pgtype.Text `json:"enterprise_identity_link_id"`
+	EnterpriseAuthzVersion   pgtype.Int8 `json:"enterprise_authz_version"`
+	EnterpriseSessionID      pgtype.Text `json:"enterprise_session_id"`
+	Column6                  string      `json:"column_6"`
+	Column7                  string      `json:"column_7"`
+}
+
+// Refreshes the platform identity binding on a subsequent exchange: a new
+// session epoch is minted per exchange and the authorization version is
+// re-anchored to whatever the platform currently reports. The platform may
+// also supply the provisioned knowledge user's real display name/email —
+// non-empty values replace the enterprise-<subject> placeholders so the
+// client UI shows the corporate identity; empty strings leave both as-is.
+func (q *Queries) UpdateUserEnterpriseIdentity(ctx context.Context, arg UpdateUserEnterpriseIdentityParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserEnterpriseIdentity,
+		arg.ID,
+		arg.EnterpriseSubject,
+		arg.EnterpriseIdentityLinkID,
+		arg.EnterpriseAuthzVersion,
+		arg.EnterpriseSessionID,
+		arg.Column6,
+		arg.Column7,
+	)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Email,
+		&i.AvatarUrl,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OnboardedAt,
+		&i.OnboardingQuestionnaire,
+		&i.CloudWaitlistEmail,
+		&i.CloudWaitlistReason,
+		&i.StarterContentState,
+		&i.Language,
+		&i.ProfileDescription,
+		&i.Timezone,
+		&i.EnterpriseSubject,
+		&i.EnterpriseIdentityLinkID,
+		&i.EnterpriseAuthzVersion,
+		&i.EnterpriseSessionID,
 	)
 	return i, err
 }

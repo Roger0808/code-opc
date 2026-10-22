@@ -705,6 +705,16 @@ type DingtalkGroupRoute struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
+type EnterpriseWorkspaceLink struct {
+	ID                  pgtype.UUID        `json:"id"`
+	UserID              pgtype.UUID        `json:"user_id"`
+	WorkspaceID         pgtype.UUID        `json:"workspace_id"`
+	PlatformWorkspaceID string             `json:"platform_workspace_id"`
+	Source              string             `json:"source"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	PlatformTenant      string             `json:"platform_tenant"`
+}
+
 type Feedback struct {
 	ID          pgtype.UUID        `json:"id"`
 	UserID      pgtype.UUID        `json:"user_id"`
@@ -1226,15 +1236,17 @@ type NotificationPreference struct {
 }
 
 type PersonalAccessToken struct {
-	ID          pgtype.UUID        `json:"id"`
-	UserID      pgtype.UUID        `json:"user_id"`
-	Name        string             `json:"name"`
-	TokenHash   string             `json:"token_hash"`
-	TokenPrefix string             `json:"token_prefix"`
-	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
-	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
-	Revoked     bool               `json:"revoked"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	ID                     pgtype.UUID        `json:"id"`
+	UserID                 pgtype.UUID        `json:"user_id"`
+	Name                   string             `json:"name"`
+	TokenHash              string             `json:"token_hash"`
+	TokenPrefix            string             `json:"token_prefix"`
+	ExpiresAt              pgtype.Timestamptz `json:"expires_at"`
+	LastUsedAt             pgtype.Timestamptz `json:"last_used_at"`
+	Revoked                bool               `json:"revoked"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	EnterpriseSubject      pgtype.Text        `json:"enterprise_subject"`
+	EnterpriseAuthzVersion pgtype.Int8        `json:"enterprise_authz_version"`
 }
 
 type PinnedItem struct {
@@ -1643,7 +1655,11 @@ type User struct {
 	Language                pgtype.Text        `json:"language"`
 	ProfileDescription      string             `json:"profile_description"`
 	// User-preferred IANA timezone for report rendering (Viewing tz). NULL means "use the browser-detected tz at render time". Affects dashboards, charts, and any "today" label shown to this user. Does not affect data materialisation — all rollups remain in UTC.
-	Timezone pgtype.Text `json:"timezone"`
+	Timezone                 pgtype.Text `json:"timezone"`
+	EnterpriseSubject        pgtype.Text `json:"enterprise_subject"`
+	EnterpriseIdentityLinkID pgtype.Text `json:"enterprise_identity_link_id"`
+	EnterpriseAuthzVersion   pgtype.Int8 `json:"enterprise_authz_version"`
+	EnterpriseSessionID      pgtype.Text `json:"enterprise_session_id"`
 }
 
 type UserComposioConnection struct {

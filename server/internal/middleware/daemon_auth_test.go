@@ -362,3 +362,41 @@ func TestDaemonAuth_MCN_OwnerNotInLocalDB(t *testing.T) {
 		t.Fatalf("expected 401 when local user is missing, got %d", w.Code)
 	}
 }
+
+// TestDaemonAuth_PATCacheHitStampsEnterpriseVersion pins N-5a: the DaemonAuth
+// PAT path stamps the cached enterprise authorization version onto the
+// request exactly like the Auth middleware's PAT path, so the
+// EnterpriseVersion middleware's PAT branch compares (subject, version)
+// against the live user row regardless of which middleware authenticated the
+// request.
+func TestDaemonAuth_PATCacheHitStampsEnterpriseVersion(t *testing.T) {
+	rdb := newRedisTestClient(t)
+	cache := auth.NewPATCache(rdb)
+	if cache == nil {
+		t.Fatal("expected non-nil cache")
+	}
+
+	const rawToken = "mul_daemon_pat_version_test"
+	hash := auth.HashToken(rawToken)
+	cache.SetIdentityFull(context.Background(), hash, "cached-user-id", "sub-ent-1", "17", auth.AuthCacheTTL)
+
+	var gotSubject, gotVersion string
+	mw := DaemonAuth(nil, cache, nil, nil)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSubject = r.Header.Get(enterpriseSubjectHeader)
+		gotVersion = r.Header.Get(enterpriseVersionHeader)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest("POST", "/api/daemon/heartbeat", nil)
+	req.Header.Set("Authorization", "Bearer "+rawToken)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if gotSubject != "sub-ent-1" || gotVersion != "17" {
+		t.Fatalf("stamped (%q, %q), want (sub-ent-1, 17)", gotSubject, gotVersion)
+	}
+}

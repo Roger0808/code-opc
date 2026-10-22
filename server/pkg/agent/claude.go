@@ -1076,12 +1076,31 @@ var claudeBlockedArgs = map[string]blockedArgMode{
 }
 
 func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
+	permissionMode := "bypassPermissions"
+	if opts.Enterprise {
+		// BND-162: an enterprise task never launches with bypassPermissions.
+		// "default" is the managed floor — every tool approval reaches the
+		// daemon's policy instead of being silently granted — and a
+		// deployment may pin another managed mode via config. The blocked
+		// args below keep a user-supplied custom_arg from overriding this
+		// back to a bypass.
+		permissionMode = strings.TrimSpace(opts.EnterpriseClaudePermissionMode)
+		if permissionMode == "" {
+			permissionMode = "default"
+		}
+		if permissionMode == "bypassPermissions" {
+			if logger != nil {
+				logger.Warn("claude: enterprise permission mode bypassPermissions rejected; falling back to default", "requested", opts.EnterpriseClaudePermissionMode)
+			}
+			permissionMode = "default"
+		}
+	}
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
-		"--permission-mode", "bypassPermissions",
+		"--permission-mode", permissionMode,
 		// AskUserQuestion is Claude Code's built-in interactive question tool.
 		// The daemon runs Claude in non-interactive stream-json mode and has
 		// no UI for the prompt to render in, so a call returns an empty
@@ -1117,15 +1136,25 @@ func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
 		args = append(args, "--resume", opts.ResumeSessionID)
 	}
 	blockedArgs := claudeBlockedArgs
-	if opts.ClaudeSettingsPath != "" {
-		// The daemon-owned --settings file is the enforcement layer for disabled
-		// inherited skills. Drop competing per-agent/default flags only while that
-		// policy is active, then append the managed file last.
-		blockedArgs = make(map[string]blockedArgMode, len(claudeBlockedArgs)+1)
+	if opts.Enterprise || opts.ClaudeSettingsPath != "" {
+		blockedArgs = make(map[string]blockedArgMode, len(claudeBlockedArgs)+3)
 		for key, mode := range claudeBlockedArgs {
 			blockedArgs[key] = mode
 		}
-		blockedArgs["--settings"] = blockedWithValue
+		if opts.Enterprise {
+			// BND-162 enterprise blocklist: flags that would return the
+			// managed launch to an unmanaged bypass. Personal tasks keep the
+			// historical blocklist — adding these globally would change
+			// personal behavior that predates the enterprise integration.
+			blockedArgs["--dangerously-skip-permissions"] = blockedStandalone
+			blockedArgs["--allow-dangerously-skip-permissions"] = blockedStandalone
+		}
+		if opts.ClaudeSettingsPath != "" {
+			// The daemon-owned --settings file is the enforcement layer for disabled
+			// inherited skills. Drop competing per-agent/default flags only while that
+			// policy is active, then append the managed file last.
+			blockedArgs["--settings"] = blockedWithValue
+		}
 	}
 	args = append(args, filterCustomArgs(opts.ExtraArgs, blockedArgs, logger)...)
 	args = append(args, filterCustomArgs(opts.CustomArgs, blockedArgs, logger)...)

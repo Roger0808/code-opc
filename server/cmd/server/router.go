@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/cloudruntime"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/enterprise"
 	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/featureflags"
@@ -39,6 +41,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/wecom"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/platform"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/seatcapacity"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -1378,6 +1381,31 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	h.DaemonTokenCache = daemonTokenCache
 	h.MembershipCache = auth.NewMembershipCache(rdb)
 
+	// Enterprise integration (OPC platform): the version cache backs the
+	// session-epoch middleware and the WS close-out; InvalidateEnterprise
+	// Version on it is the hook the platform push channel calls when an
+	// authorization version moves. The platform client is nil when the
+	// deployment has no PLATFORM_BASE_URL — every enterprise flow fails
+	// closed on that.
+	entVersionCache := middleware.NewEnterpriseVersionCache(rdb)
+	h.EnterpriseVersionCache = entVersionCache
+	h.PlatformServiceToken = os.Getenv("PLATFORM_SERVICE_TOKEN")
+	if platformClient, err := platform.New(platform.Config{
+		BaseURL:         os.Getenv("PLATFORM_BASE_URL"),
+		ServiceToken:    os.Getenv("PLATFORM_SERVICE_TOKEN"),
+		LeaseHMACSecret: os.Getenv("PLATFORM_LEASE_HMAC_SECRET"),
+		Issuer:          os.Getenv("PLATFORM_ISSUER"),
+	}); err == nil {
+		h.Platform = platformClient
+		if resolver, rerr := enterprise.NewResolver(platformClient, enterpriseSkillCacheDir()); rerr == nil {
+			h.EnterpriseSkillResolver = resolver
+		} else {
+			slog.Warn("enterprise skill resolver disabled", "error", rerr)
+		}
+	} else if !errors.Is(err, platform.ErrNotConfigured) {
+		slog.Warn("platform integration disabled: invalid configuration", "error", err)
+	}
+
 	// Cloud PAT verifier: validates mcn_ tokens against Multica Cloud
 	// Fleet. Returns nil when no Cloud URL is configured — the Auth /
 	// DaemonAuth middlewares treat nil as "mcn_ not supported" and
@@ -1465,7 +1493,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		return util.UUIDToString(ws.ID), nil
 	})
 	r.Get("/ws", func(w http.ResponseWriter, r *http.Request) {
-		realtime.HandleWebSocket(hub, mc, pr, slugResolver, w, r)
+		// Enterprise close-out: a connection authenticated with an
+		// enterprise credential whose epoch no longer matches the user row
+		// receives {type:"enterprise_revoked"} and is closed before any
+		// channel registration. Personal connections skip the check.
+		realtime.HandleWebSocketWithEnterprise(hub, mc, pr, slugResolver, enterpriseWSChecker(entVersionCache, queries), w, r)
 	})
 
 	// Local file serving (when using local storage). Served through the
@@ -1517,6 +1549,17 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.With(authRL).Post("/auth/google", h.GoogleLogin)
 	r.Post("/auth/logout", h.Logout)
 
+	// Enterprise login (OPC platform integration): begin proxies the platform
+	// INT-101a authorize transaction and exchange consumes the one-time login
+	// material (INT-101g). Both are PRE-SESSION by definition — the caller
+	// holds no Multica session yet — so they must live outside middleware.Auth.
+	// RequireHumanActor does not apply here: there is no actor at all. The
+	// abuse surface is rate-limited exactly like send-code: 5 requests/minute
+	// per client IP.
+	enterpriseRL := middleware.RateLimit(rdb, envPositiveInt("RATE_LIMIT_ENTERPRISE_LOGIN", 5), time.Minute, trustedProxies)
+	r.With(enterpriseRL).Post("/api/enterprise/begin", h.EnterpriseBegin)
+	r.With(enterpriseRL).Post("/api/enterprise/exchange", h.EnterpriseExchange)
+
 	// Public API
 	r.Get("/api/config", h.GetConfig)
 	r.With(contactSalesRL).Post("/api/contact-sales", h.CreateContactSales)
@@ -1560,8 +1603,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	r.Get("/api/integrations/composio/callback", h.ComposioCallback)
 
 	// Daemon API routes (require daemon token or valid user token)
+	r.Post("/api/internal/enterprise/invalidate", h.EnterpriseInvalidate)
+
 	r.Route("/api/daemon", func(r chi.Router) {
 		r.Use(middleware.DaemonAuth(queries, patCache, daemonTokenCache, cloudPATVerifier))
+		// Enterprise epoch enforcement for daemon endpoints that carry user
+		// credentials (daemon-auth JWT/PAT fallbacks). mdt_-authenticated
+		// requests stamp no enterprise headers, so this is a no-op for them;
+		// enterprise task dispatch itself is gated by the claim-time lease
+		// checkpoint in the handlers.
+		r.Use(middleware.EnterpriseVersion(entVersionCache, queries, h.EnterpriseAuthzRefresher()))
 
 		r.Post("/register", h.DaemonRegister)
 		r.Post("/deregister", h.DaemonDeregister)
@@ -1580,6 +1631,11 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Get("/tasks/{id}/plugin-mcp/{contributionId}/credential", h.ResolvePluginMCPCredential)
 
 		r.Post("/runtimes/{runtimeId}/tasks/claim", h.ClaimTaskByRuntime)
+		// Enterprise lease renewal (TASK-C02): the daemon renews the
+		// claim-issued platform lease for the life of the task, presenting it
+		// as X-Enterprise-Lease; the server revalidates and proxies to the
+		// platform with its service token.
+		r.Post("/runtimes/{runtimeId}/tasks/{taskId}/enterprise-lease/renew", h.RenewEnterpriseLease)
 		// Canonical machine-level batch claim (MUL-4257). `/claim` is a
 		// transitional alias; the daemon coordinator targets the canonical
 		// path.
@@ -2005,6 +2061,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		// --- Workspace-scoped routes (all require workspace membership) ---
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.RequireWorkspaceMember(queries))
+			// Enterprise session epoch: requests carrying enterprise
+			// credentials must still match the user row, on mutations and
+			// reads alike. Personal requests pass through untouched.
+			r.Use(middleware.EnterpriseVersion(entVersionCache, queries, h.EnterpriseAuthzRefresher()))
 
 			// Assignee frequency
 			r.Get("/api/assignee-frequency", h.GetAssigneeFrequency)
@@ -2644,15 +2704,23 @@ type patResolver struct {
 }
 
 func (pr *patResolver) ResolveToken(ctx context.Context, token string) (string, bool) {
+	userID, _, ok := pr.ResolveTokenEnterprise(ctx, token)
+	return userID, ok
+}
+
+// ResolveTokenEnterprise implements realtime.EnterprisePATResolver: the
+// websocket enterprise close-out needs the enterprise subject snapshot
+// alongside the user id, through the same PAT cache the HTTP middlewares use.
+func (pr *patResolver) ResolveTokenEnterprise(ctx context.Context, token string) (string, string, bool) {
 	hash := auth.HashToken(token)
 
-	if userID, ok := pr.cache.Get(ctx, hash); ok {
-		return userID, true
+	if userID, entSubject, ok := pr.cache.GetIdentity(ctx, hash); ok {
+		return userID, entSubject, true
 	}
 
 	pat, err := pr.queries.GetPersonalAccessTokenByHash(ctx, hash)
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 
 	userID := util.UUIDToString(pat.UserID)
@@ -2661,13 +2729,32 @@ func (pr *patResolver) ResolveToken(ctx context.Context, token string) (string, 
 	if pat.ExpiresAt.Valid {
 		expiresAt = pat.ExpiresAt.Time
 	}
-	pr.cache.Set(ctx, hash, userID, auth.TTLForExpiry(time.Now(), expiresAt))
+	pr.cache.SetIdentity(ctx, hash, userID, pat.EnterpriseSubject.String, auth.TTLForExpiry(time.Now(), expiresAt))
 
 	// Cache miss = first WS auth in this TTL window. Refresh last_used_at;
 	// subsequent connects within the window skip the write.
 	go pr.queries.UpdatePersonalAccessTokenLastUsed(context.Background(), pat.ID)
 
-	return userID, true
+	return userID, pat.EnterpriseSubject.String, true
+}
+
+// enterpriseWSChecker validates the enterprise epoch of a freshly
+// authenticated user websocket. It mirrors middleware.EnterpriseVersion:
+// session tokens must match the current (session id, authorization version)
+// pair, enterprise PATs their issuance-time subject snapshot. A revoked
+// entitlement closes the connection with an enterprise_revoked frame.
+func enterpriseWSChecker(cache *middleware.EnterpriseVersionCache, queries *db.Queries) realtime.EnterpriseSessionChecker {
+	return func(ctx context.Context, userID string, ent realtime.EnterpriseTokenInfo) bool {
+		current, err := cache.Current(ctx, queries, userID)
+		if err != nil {
+			slog.Warn("ws enterprise check: identity resolution failed", "user_id", userID, "error", err)
+			return false
+		}
+		if ent.SessionID != "" {
+			return current.Enterprise && current.SessionID == ent.SessionID && current.Version == ent.Version
+		}
+		return current.Enterprise && current.Subject == ent.PATSubject
+	}
 }
 
 // parseUUID is a thin alias for util.MustParseUUID. Call sites here are all
@@ -2702,6 +2789,17 @@ func splitAndTrim(s string) []string {
 		}
 	}
 	return res
+}
+
+// enterpriseSkillCacheDir is the root under which the BND-142 five-tuple
+// cache directories are created. Explicit PLATFORM_SKILL_CACHE_DIR wins; the
+// default lives in the OS temp area, which is fine because the cache is
+// re-validated against the pin on every read and re-downloaded on eviction.
+func enterpriseSkillCacheDir() string {
+	if dir := strings.TrimSpace(os.Getenv("PLATFORM_SKILL_CACHE_DIR")); dir != "" {
+		return dir
+	}
+	return filepath.Join(os.TempDir(), "multica-enterprise-skills")
 }
 
 // composioStateSecret resolves the HMAC key for the connect-state. Prefers an

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +83,9 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 			// fixed in #4313.
 			r.Header.Del("X-Agent-ID")
 			r.Header.Del("X-Task-ID")
+			// Enterprise identity headers are stamped from the authenticated
+			// credential below; anything the client sent is untrusted.
+			stripEnterpriseHeaders(r)
 
 			tokenString, fromCookie := extractToken(r)
 			if tokenString == "" {
@@ -205,11 +209,17 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				// last time we looked, and nothing has invalidated the
 				// entry since. Skip the DB SELECT and the last_used_at
 				// UPDATE — last_used_at is bumped once per TTL window.
-				if userID, ok := patCache.Get(r.Context(), hash); ok {
+				// The cached value carries the enterprise subject snapshot
+				// so the enterprise version check survives the cache.
+				if userID, entSubject, ok := patCache.GetIdentity(r.Context(), hash); ok {
 					if rejectTemporarilyDisabledUser(w, r, userID, "", "pat_cache") {
 						return
 					}
 					r.Header.Set("X-User-ID", userID)
+					stampEnterpriseSubject(r, entSubject)
+					if _, _, entVer, ok := patCache.GetIdentityFull(r.Context(), hash); ok {
+						stampEnterpriseVersion(r, entVer)
+					}
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -230,6 +240,10 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 					return
 				}
 				r.Header.Set("X-User-ID", userID)
+				stampEnterpriseSubject(r, pat.EnterpriseSubject.String)
+				if pat.EnterpriseAuthzVersion.Valid {
+					stampEnterpriseVersion(r, strconv.FormatInt(pat.EnterpriseAuthzVersion.Int64, 10))
+				}
 
 				// Clamp cache TTL to the token's remaining lifetime so a
 				// PAT expiring in <AuthCacheTTL can't continue passing
@@ -238,7 +252,11 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 				if pat.ExpiresAt.Valid {
 					expiresAt = pat.ExpiresAt.Time
 				}
-				patCache.Set(r.Context(), hash, userID, auth.TTLForExpiry(time.Now(), expiresAt))
+				patVer := ""
+				if pat.EnterpriseAuthzVersion.Valid {
+					patVer = strconv.FormatInt(pat.EnterpriseAuthzVersion.Int64, 10)
+				}
+				patCache.SetIdentityFull(r.Context(), hash, userID, pat.EnterpriseSubject.String, patVer, auth.TTLForExpiry(time.Now(), expiresAt))
 
 				// Cache miss = TTL expired (or first use after revoke /
 				// process restart). Refresh last_used_at; subsequent hits
@@ -283,12 +301,13 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 			if email != "" {
 				r.Header.Set("X-User-Email", email)
 			}
+			stampEnterpriseFromClaims(r, claims)
 
 			// Sliding session: a browser that keeps using the app keeps its
 			// cookie, instead of being logged out on the anniversary of its
 			// login. No-op until the session drops below half its TTL
 			// (MUL-7436).
-			r = renewCookieSession(w, r, claims, fromCookie, cfSigner)
+			r = renewCookieSession(w, r, claims, fromCookie, cfSigner, enterpriseRefresher(queries))
 
 			next.ServeHTTP(w, r)
 		})

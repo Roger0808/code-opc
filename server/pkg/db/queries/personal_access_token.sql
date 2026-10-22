@@ -1,6 +1,10 @@
 -- name: CreatePersonalAccessToken :one
-INSERT INTO personal_access_token (user_id, name, token_hash, token_prefix, expires_at)
-VALUES ($1, $2, $3, $4, $5)
+-- enterprise_subject + enterprise_authz_version snapshot the issuer's platform
+-- identity at issuance so the auth middleware can re-check enterprise PATs
+-- against the user's current identity without trusting the 10-minute PAT
+-- cache for that signal.
+INSERT INTO personal_access_token (user_id, name, token_hash, token_prefix, expires_at, enterprise_subject, enterprise_authz_version)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
 -- name: GetPersonalAccessTokenByHash :one

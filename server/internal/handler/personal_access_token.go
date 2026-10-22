@@ -100,12 +100,25 @@ func (h *Handler) CreatePersonalAccessToken(w http.ResponseWriter, r *http.Reque
 		prefix = prefix[:12]
 	}
 
+	// Enterprise users snapshot their platform subject into the PAT row. The
+	// auth middleware layers the enterprise version check on top of the
+	// 10-minute PAT cache using this snapshot; a PAT minted before linkage
+	// (NULL here) is a plain personal token.
+	var enterpriseSubject pgtype.Text
+	var enterpriseVersion pgtype.Int8
+	if user, err := h.Queries.GetUser(r.Context(), parseUUID(userID)); err == nil {
+		enterpriseSubject = user.EnterpriseSubject
+		enterpriseVersion = user.EnterpriseAuthzVersion
+	}
+
 	pat, err := h.Queries.CreatePersonalAccessToken(r.Context(), db.CreatePersonalAccessTokenParams{
-		UserID:      parseUUID(userID),
-		Name:        req.Name,
-		TokenHash:   auth.HashToken(rawToken),
-		TokenPrefix: prefix,
-		ExpiresAt:   expiresAt,
+		UserID:                 parseUUID(userID),
+		Name:                   req.Name,
+		TokenHash:              auth.HashToken(rawToken),
+		TokenPrefix:            prefix,
+		ExpiresAt:              expiresAt,
+		EnterpriseSubject:      enterpriseSubject,
+		EnterpriseAuthzVersion: enterpriseVersion,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create token")

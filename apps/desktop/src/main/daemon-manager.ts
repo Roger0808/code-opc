@@ -52,6 +52,10 @@ import {
   isAuthStatusError,
   type AuthProbeResult,
 } from "./daemon-auth-probe";
+import {
+  planDaemonTokenSync,
+  shouldRestartDaemonAfterUserSwitch,
+} from "./daemon-token-policy";
 
 const POLL_INTERVAL_MS = 5_000;
 const PREFS_PATH = join(homedir(), ".multica", "desktop_prefs.json");
@@ -697,12 +701,16 @@ async function mintPat(jwt: string): Promise<string> {
  *   mint a fresh PAT, overwriting any stale cached PAT. This is the critical
  *   path: without it, a previous user's PAT would be used by a new session.
  * - If the caller happens to pass a PAT directly, write it through.
+ * - Enterprise sessions never write a PAT (BND-161): enterprise daemon task
+ *   claims authenticate through platform task leases, so any token left by a
+ *   previous personal session is removed instead.
  * - Reports a user mismatch to the caller; the IPC boundary owns the gated
  *   restart so internal callers such as reauthenticate never re-enter it.
  */
 async function syncToken(
   tokenFromRenderer: string,
   userId: string,
+  options: { enterprise?: boolean } = {},
 ): Promise<{ active: ActiveProfile; userChanged: boolean }> {
   const active = await ensureActiveProfile();
   if (!active) {
@@ -713,33 +721,42 @@ async function syncToken(
   }
   const config = await readProfileConfig(active.name);
   const previousUserId = await readProfileUserId(active.name);
-  const userChanged = Boolean(previousUserId) && previousUserId !== userId;
-  const sameUserWithCachedPat =
-    !userChanged &&
-    previousUserId === userId &&
-    typeof config.token === "string" &&
-    config.token.startsWith("mul_");
+  const userChanged = shouldRestartDaemonAfterUserSwitch(
+    previousUserId,
+    userId,
+  );
+  const plan = planDaemonTokenSync({
+    tokenFromRenderer,
+    cachedToken: config.token,
+    previousUserId,
+    userId,
+    enterprise: options.enterprise === true,
+  });
 
-  let finalToken: string;
-  if (tokenFromRenderer.startsWith("mul_")) {
-    finalToken = tokenFromRenderer;
-  } else if (sameUserWithCachedPat) {
-    finalToken = config.token as string;
-  } else {
-    try {
-      finalToken = await mintPat(tokenFromRenderer);
-      console.log(
-        `[daemon] minted PAT for profile "${active.name}" (user_changed=${userChanged})`,
-      );
-    } catch (err) {
-      console.error("[daemon] failed to mint PAT:", err);
-      throw err;
+  if (plan.action === "enterprise_skip") {
+    if ("token" in config) {
+      delete config.token;
+      await writeProfileConfig(active.name, config);
     }
+  } else {
+    let finalToken: string;
+    if (plan.action === "write") {
+      finalToken = plan.token;
+    } else {
+      try {
+        finalToken = await mintPat(tokenFromRenderer);
+        console.log(
+          `[daemon] minted PAT for profile "${active.name}" (user_changed=${userChanged})`,
+        );
+      } catch (err) {
+        console.error("[daemon] failed to mint PAT:", err);
+        throw err;
+      }
+    }
+    config.token = finalToken;
+    if (targetApiBaseUrl) config.server_url = targetApiBaseUrl;
+    await writeProfileConfig(active.name, config);
   }
-
-  config.token = finalToken;
-  if (targetApiBaseUrl) config.server_url = targetApiBaseUrl;
-  await writeProfileConfig(active.name, config);
   await writeProfileUserId(active.name, userId);
 
   return { active, userChanged };
@@ -1389,8 +1406,10 @@ export function setupDaemonManager(
   ipcMain.handle("daemon:get-host-name", () => hostname());
   ipcMain.handle(
     "daemon:sync-token",
-    async (_event, token: string, userId: string) => {
-      const result = await syncToken(token, userId);
+    async (_event, token: string, userId: string, sessionKind?: string) => {
+      const result = await syncToken(token, userId, {
+        enterprise: sessionKind === "enterprise",
+      });
       if (result.userChanged) {
         await restartDaemonAfterUserSwitch(result.active);
       }

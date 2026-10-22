@@ -196,7 +196,7 @@ func TestStartClaimWirePrecision(t *testing.T) {
 		t.Run(zone.String(), func(t *testing.T) {
 			claimed := task
 			claimed.DispatchedAt.Time = task.DispatchedAt.Time.In(zone)
-			resp, _, _, _, _, failure := testHandler.buildClaimedTaskResponse(req, &claimed, runtime, runtimeID, testWorkspaceID)
+			resp, _, _, _, _, failure := testHandler.buildClaimedTaskResponse(req, &claimed, runtime, runtimeID, testWorkspaceID, false)
 			if failure != nil {
 				t.Fatalf("build claim: %+v", failure)
 			}

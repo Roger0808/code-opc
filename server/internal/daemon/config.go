@@ -158,6 +158,14 @@ type Config struct {
 	CodebuddyArgs               []string
 	QwenArgs                    []string
 	QwenpawArgs                 []string
+	// EnterpriseClaudePermissionMode overrides the managed --permission-mode
+	// value for enterprise Claude tasks (BND-162). Empty keeps the backend
+	// default "default"; the claude backend rejects "bypassPermissions".
+	EnterpriseClaudePermissionMode string
+	// EnterpriseCodexApprovalPolicy overrides the managed thread/start
+	// approvalPolicy for enterprise Codex tasks (BND-162). Empty keeps the
+	// backend default "untrusted".
+	EnterpriseCodexApprovalPolicy string
 
 	// ProfileCommandOverrides maps a custom runtime profile_id -> the absolute
 	// executable path to use for that profile on THIS machine (MUL-3284).
@@ -289,6 +297,13 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+
+	// Enterprise managed execution parameters (BND-162). These override the
+	// managed defaults for enterprise tasks only; personal tasks never read
+	// them. Empty keeps the backend default (claude: "default", codex:
+	// "untrusted").
+	enterpriseClaudePermissionMode := strings.TrimSpace(os.Getenv("MULTICA_ENTERPRISE_CLAUDE_PERMISSION_MODE"))
+	enterpriseCodexApprovalPolicy := strings.TrimSpace(os.Getenv("MULTICA_ENTERPRISE_CODEX_APPROVAL_POLICY"))
 
 	// Host info
 	host, err := os.Hostname()
@@ -668,6 +683,8 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		CodebuddyArgs:                   codebuddyArgs,
 		QwenArgs:                        qwenArgs,
 		QwenpawArgs:                     qwenpawArgs,
+		EnterpriseClaudePermissionMode:  enterpriseClaudePermissionMode,
+		EnterpriseCodexApprovalPolicy:   enterpriseCodexApprovalPolicy,
 		ProfileCommandOverrides:         profileCommandOverrides,
 	}, nil
 }

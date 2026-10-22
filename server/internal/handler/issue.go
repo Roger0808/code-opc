@@ -4042,6 +4042,39 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enterprise initiator gate (pre-write): if this update would enqueue a
+	// run, refuse BEFORE persisting anything — the post-write refusal in
+	// dispatchIssueRun must never leave a persisted edit behind. The
+	// prospective issue mirrors the requested status/assignee; the dispatch
+	// decision below still recomputes from the actually-updated row.
+	prospective := prevIssue
+	if params.Status.Valid {
+		prospective.Status = params.Status.String
+	}
+	if params.AssigneeType.Valid {
+		prospective.AssigneeType = params.AssigneeType
+	}
+	if params.AssigneeID.Valid {
+		prospective.AssigneeID = params.AssigneeID
+	}
+	prospectiveActorType, prospectiveActorID := h.resolveActor(r, userID, workspaceID)
+	_, prospectiveWillRun := h.IssueService.WillEnqueueRun(r.Context(),
+		service.IssueTriggerInput{
+			Issue:              prospective,
+			PrevStatus:         prevIssue.Status,
+			AssigneeChanged:    touchedType || touchedID || handoff != nil,
+			StatusChanged:      params.Status.Valid && params.Status.String != prevIssue.Status,
+			EnteredHandoffStep: handoff != nil,
+		},
+		h.issueTriggerWriteProbe(r, prospectiveActorType, prospectiveActorID, prospective),
+	)
+	if prospectiveWillRun && !req.SuppressRun {
+		if err := h.enterpriseInitiatorGateHTTP(r, prospectiveActorType, prospectiveActorID, prevIssue.WorkspaceID); err != nil {
+			writeEnterpriseInitiatorRefusal(w)
+			return
+		}
+	}
+
 	// The agent this write hands the issue to gets the change as its own run,
 	// not also through its event wakeups.
 	writeCtx := withWakeupHandedTo(r.Context(), h.handedToAgent(r.Context(), prevIssue, params, handoff != nil))
@@ -4190,7 +4223,10 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		h.stopPreviousAssigneeRuns(r.Context(), prevIssue, issue, actorType, actorID)
 	}
 	if willRun {
-		h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, handoffNote)
+		if err := h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, handoffNote); err != nil {
+			writeEnterpriseInitiatorRefusal(w)
+			return
+		}
 	}
 
 	// Sub-issue rules on the parent (the child_done system rule and sub-issue
@@ -4945,7 +4981,10 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			h.stopPreviousAssigneeRuns(r.Context(), prevIssue, issue, actorType, actorID)
 		}
 		if willRun {
-			h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, batchHandoffNote)
+			if err := h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, batchHandoffNote); err != nil {
+				writeEnterpriseInitiatorRefusal(w)
+				return
+			}
 		}
 
 		// No status change — not even → cancelled — cancels active tasks here,

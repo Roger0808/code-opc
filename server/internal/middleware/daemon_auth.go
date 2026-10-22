@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -96,6 +97,7 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 			// never these headers (MUL-3428, #4313).
 			r.Header.Del("X-Agent-ID")
 			r.Header.Del("X-Task-ID")
+			stripEnterpriseHeaders(r)
 
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" {
@@ -201,11 +203,18 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 			if strings.HasPrefix(tokenString, "mul_") {
 				hash := auth.HashToken(tokenString)
 
-				if userID, ok := patCache.Get(r.Context(), hash); ok {
+				if userID, entSubject, ok := patCache.GetIdentity(r.Context(), hash); ok {
 					if rejectTemporarilyDisabledUser(w, r, userID, "", DaemonAuthPathPAT) {
 						return
 					}
 					r.Header.Set("X-User-ID", userID)
+					stampEnterpriseSubject(r, entSubject)
+					// Same enterprise version snapshot as the Auth
+					// middleware's PAT path: the EnterpriseVersion check
+					// compares it against the live user row.
+					if _, _, entVer, ok := patCache.GetIdentityFull(r.Context(), hash); ok {
+						stampEnterpriseVersion(r, entVer)
+					}
 					ctx := context.WithValue(r.Context(), ctxKeyDaemonAuthPath, DaemonAuthPathPAT)
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
@@ -227,12 +236,20 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 					return
 				}
 				r.Header.Set("X-User-ID", userID)
+				stampEnterpriseSubject(r, pat.EnterpriseSubject.String)
+				if pat.EnterpriseAuthzVersion.Valid {
+					stampEnterpriseVersion(r, strconv.FormatInt(pat.EnterpriseAuthzVersion.Int64, 10))
+				}
 
 				var expiresAt time.Time
 				if pat.ExpiresAt.Valid {
 					expiresAt = pat.ExpiresAt.Time
 				}
-				patCache.Set(r.Context(), hash, userID, auth.TTLForExpiry(time.Now(), expiresAt))
+				patVer := ""
+				if pat.EnterpriseAuthzVersion.Valid {
+					patVer = strconv.FormatInt(pat.EnterpriseAuthzVersion.Int64, 10)
+				}
+				patCache.SetIdentityFull(r.Context(), hash, userID, pat.EnterpriseSubject.String, patVer, auth.TTLForExpiry(time.Now(), expiresAt))
 
 				// Cache miss = first request in this TTL window. Refresh
 				// last_used_at; subsequent hits skip the write entirely.
@@ -271,6 +288,7 @@ func DaemonAuth(queries *db.Queries, patCache *auth.PATCache, daemonCache *auth.
 				return
 			}
 			r.Header.Set("X-User-ID", sub)
+			stampEnterpriseFromClaims(r, claims)
 			ctx := context.WithValue(r.Context(), ctxKeyDaemonAuthPath, DaemonAuthPathJWT)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

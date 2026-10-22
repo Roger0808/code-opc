@@ -63,6 +63,22 @@ import {
   NotificationGate,
   parseNativeNotificationPayload,
 } from "./notification-gate";
+import {
+  startEnterpriseAuthServer,
+  type EnterpriseAuthServerHandle,
+} from "./enterprise-auth-server";
+import {
+  deleteEnterpriseCredential,
+  hasEnterpriseCredential,
+  openEnterpriseCredential,
+  openEnterpriseCredentialSync,
+  sealEnterpriseCredential,
+} from "./enterprise-credentials";
+import type {
+  EnterpriseAuthBeginResult,
+  EnterpriseCallbackPayload,
+} from "../shared/enterprise";
+import { ENTERPRISE_SESSION_PROFILE } from "../shared/enterprise";
 
 configureLinuxFileDialogs(app.commandLine);
 
@@ -146,6 +162,9 @@ const notificationGate = new NotificationGate();
 const mainRendererMessages = new MainRendererMessageQueue();
 let desktopInitialized = false;
 let authSessionGeneration = 0;
+// At most one enterprise login attempt at a time. The handle owns the
+// loopback HTTP server and the one-time callback state.
+let enterpriseAuthHandle: EnterpriseAuthServerHandle | null = null;
 const rendererRouteContexts = new WeakMap<
   Electron.WebContents,
   RendererRouteContext
@@ -212,6 +231,14 @@ function handleDeepLink(url: string): void {
   } catch {
     // Ignore malformed URLs
   }
+}
+
+// --- Enterprise auth (loopback callback + credential vault) ---------------
+
+async function closeEnterpriseAuthHandle(): Promise<void> {
+  const handle = enterpriseAuthHandle;
+  enterpriseAuthHandle = null;
+  if (handle) await handle.close();
 }
 
 // --- Window creation -----------------------------------------------------
@@ -626,6 +653,7 @@ if (!gotTheLock) {
       readonly VITE_API_URL?: string;
       readonly VITE_WS_URL?: string;
       readonly VITE_APP_URL?: string;
+      readonly VITE_PLATFORM_URL?: string;
     };
 
     runtimeConfigResult = await loadRuntimeConfig({
@@ -637,6 +665,7 @@ if (!gotTheLock) {
         apiUrl: viteEnv.VITE_API_URL,
         wsUrl: viteEnv.VITE_WS_URL,
         appUrl: viteEnv.VITE_APP_URL,
+        platformUrl: viteEnv.VITE_PLATFORM_URL,
       },
     });
 
@@ -724,6 +753,78 @@ if (!gotTheLock) {
     // blocking error and must not silently fall back to the cloud defaults.
     ipcMain.on("runtime-config:get", (event) => {
       event.returnValue = runtimeConfigResult;
+    });
+
+    // Enterprise login (OPEN-104 / BND-161). Main owns the loopback callback
+    // server and the safeStorage-backed credential vault; plaintext values
+    // cross this boundary only in memory, during the login flow.
+    ipcMain.handle(
+      "enterprise:begin-auth",
+      async (): Promise<EnterpriseAuthBeginResult> => {
+        await closeEnterpriseAuthHandle();
+        try {
+          const handle = await startEnterpriseAuthServer({
+            onCallback: (code) => {
+              enterpriseAuthHandle = null;
+              dispatchToMainRenderer("enterprise:callback", {
+                code,
+              } satisfies EnterpriseCallbackPayload);
+            },
+            onExpired: () => {
+              enterpriseAuthHandle = null;
+              dispatchToMainRenderer("enterprise:callback", {
+                error: "expired",
+              } satisfies EnterpriseCallbackPayload);
+            },
+          });
+          enterpriseAuthHandle = handle;
+          return { ok: true, port: handle.port, state: handle.state };
+        } catch (err) {
+          console.error(
+            "[enterprise] failed to start loopback auth server:",
+            err,
+          );
+          return { ok: false, error: "unavailable" };
+        }
+      },
+    );
+
+    ipcMain.handle("enterprise:cancel-auth", () =>
+      closeEnterpriseAuthHandle(),
+    );
+
+    ipcMain.handle(
+      "enterprise:seal",
+      (_event, profile: unknown, plaintext: unknown) => {
+        if (typeof profile !== "string" || typeof plaintext !== "string") {
+          throw new Error("enterprise:seal expects string arguments");
+        }
+        return sealEnterpriseCredential(profile, plaintext);
+      },
+    );
+    ipcMain.handle("enterprise:open", (_event, profile: unknown) => {
+      if (typeof profile !== "string") return null;
+      return openEnterpriseCredential(profile);
+    });
+    ipcMain.handle("enterprise:delete", (_event, profile: unknown) => {
+      if (typeof profile !== "string") return;
+      return deleteEnterpriseCredential(profile);
+    });
+    ipcMain.handle("enterprise:has", (_event, profile: unknown) => {
+      if (typeof profile !== "string") return false;
+      return hasEnterpriseCredential(profile);
+    });
+
+    // Sync boot-time restore: the renderer must have the sealed enterprise
+    // session token before its first render, so this cannot be an invoke.
+    ipcMain.on("enterprise:restore", (event) => {
+      event.returnValue = openEnterpriseCredentialSync(
+        ENTERPRISE_SESSION_PROFILE,
+      );
+    });
+
+    app.on("before-quit", () => {
+      void closeEnterpriseAuthHandle();
     });
 
     ipcMain.on(RENDERER_ROUTE_CONTEXT_CHANNEL, (event, context: unknown) => {

@@ -3,6 +3,13 @@ export interface RuntimeConfig {
   apiUrl: string;
   wsUrl: string;
   appUrl: string;
+  /**
+   * Base URL of the OPC identity platform that serves the INT-101a enterprise
+   * authorize endpoint. Optional: self-hosted deployments that have not wired
+   * enterprise login omit it, and the desktop hides the enterprise sign-in
+   * option. Never guessed from apiUrl — the platform is a separate service.
+   */
+  platformUrl?: string;
 }
 
 export interface RuntimeConfigError {
@@ -31,6 +38,7 @@ export interface RuntimeConfigEnv {
   apiUrl?: string;
   wsUrl?: string;
   appUrl?: string;
+  platformUrl?: string;
 }
 
 export function runtimeConfigFromDevEnv(env: RuntimeConfigEnv): RuntimeConfig {
@@ -47,6 +55,9 @@ export function runtimeConfigFromDevEnv(env: RuntimeConfigEnv): RuntimeConfig {
     appUrl: env.appUrl
       ? normalizeHttpUrl(env.appUrl, "VITE_APP_URL")
       : deriveDevAppUrl(apiUrl),
+    ...(env.platformUrl
+      ? { platformUrl: normalizeHttpUrl(env.platformUrl, "VITE_PLATFORM_URL") }
+      : {}),
   };
 }
 
@@ -72,6 +83,7 @@ export function parseRuntimeConfig(raw: string): RuntimeConfig {
   const apiUrl = requiredString(obj.apiUrl, "apiUrl");
   const appUrl = optionalString(obj.appUrl, "appUrl");
   const wsUrl = optionalString(obj.wsUrl, "wsUrl");
+  const platformUrl = optionalString(obj.platformUrl, "platformUrl");
 
   const normalizedApiUrl = normalizeHttpUrl(apiUrl, "apiUrl");
   return {
@@ -79,6 +91,9 @@ export function parseRuntimeConfig(raw: string): RuntimeConfig {
     apiUrl: normalizedApiUrl,
     wsUrl: wsUrl ? normalizeWsUrl(wsUrl, "wsUrl") : deriveWsUrl(normalizedApiUrl),
     appUrl: appUrl ? normalizeHttpUrl(appUrl, "appUrl") : deriveAppUrl(normalizedApiUrl),
+    ...(platformUrl
+      ? { platformUrl: normalizeHttpUrl(platformUrl, "platformUrl") }
+      : {}),
   };
 }
 

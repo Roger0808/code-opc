@@ -1281,6 +1281,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		activeLaunches:           activeLaunches,
 		notificationProtocol:     "unknown",
 		acceptNotification:       turnNotificationGate.accept,
+		enterprise:               opts.Enterprise,
 		guardianRateLimitCircuit: &codexGuardianRateLimitCircuit{},
 		onGuardianRateLimit: func() {
 			guardianRateLimitTripped.Store(true)
@@ -2066,21 +2067,7 @@ func (c *codexClient) startOrResumeThread(ctx context.Context, opts ExecOptions,
 	// Confirmed end-to-end against codex-cli 0.144.6 driving the real
 	// app-server (thread/start -> turn/start) with developerInstructions unset
 	// (MUL-5392).
-	startParams := map[string]any{
-		"model":                  nilIfEmpty(opts.Model),
-		"modelProvider":          nil,
-		"profile":                nil,
-		"cwd":                    opts.Cwd,
-		"approvalPolicy":         nil,
-		"sandbox":                nil,
-		"config":                 nil,
-		"baseInstructions":       nil,
-		"developerInstructions":  nil,
-		"compactPrompt":          nil,
-		"includeApplyPatchTool":  nil,
-		"experimentalRawEvents":  false,
-		"persistExtendedHistory": true,
-	}
+	startParams := codexThreadStartParams(opts)
 	applyCodexReasoningEffort(startParams, opts.ThinkingLevel)
 	applyCodexServiceTier(startParams, opts.ServiceTier)
 	c.threadSetupMethod = "thread/start"
@@ -2411,6 +2398,11 @@ type codexClient struct {
 	// replay emitted while thread/resume is restoring prior conversation.
 	// Unit-level protocol tests leave it nil and exercise dispatch directly.
 	acceptNotification func(method string, params map[string]any) bool
+	// enterprise marks a task dispatched under the enterprise protocol
+	// (BND-162). Approval-class app-server requests are never auto-accepted
+	// for such tasks: every exec/patch/permission/elicitation request is
+	// denied so privileged actions cannot self-authorize.
+	enterprise bool
 	// onDiscardedNotification preserves out-of-band safety signals (such as
 	// suppressing an initialize retry after observed activity) without letting
 	// filtered history mutate current-turn output or lifecycle state.
@@ -2922,15 +2914,39 @@ func (c *codexClient) handleServerRequest(raw map[string]json.RawMessage) {
 	var method string
 	_ = json.Unmarshal(raw["method"], &method)
 
-	// Auto-approve all exec/patch requests in daemon mode
+	// Auto-approve all exec/patch requests in daemon mode. Enterprise tasks
+	// (BND-162) are the exception: no approval-class request is answered with
+	// an automatic grant. The action is denied, so a privileged operation
+	// cannot self-authorize on a machine it was only leased to prepare —
+	// rerunning it under an authorized identity is the recovery path.
 	switch method {
 	case "item/commandExecution/requestApproval", "execCommandApproval":
+		if c.enterprise {
+			c.cfg.Logger.Warn("codex: denying command approval request on enterprise task", "id", id, "method", method)
+			c.respond(id, map[string]any{"decision": "reject"})
+			return
+		}
 		c.respond(id, map[string]any{"decision": "accept"})
 	case "item/fileChange/requestApproval", "applyPatchApproval":
+		if c.enterprise {
+			c.cfg.Logger.Warn("codex: denying patch approval request on enterprise task", "id", id, "method", method)
+			c.respond(id, map[string]any{"decision": "reject"})
+			return
+		}
 		c.respond(id, map[string]any{"decision": "accept"})
 	case "item/permissions/requestApproval":
+		if c.enterprise {
+			c.cfg.Logger.Warn("codex: denying permissions request on enterprise task", "id", id)
+			c.respond(id, map[string]any{"permissions": map[string]any{}, "scope": "turn"})
+			return
+		}
 		c.respond(id, codexPermissionsApprovalResponse(raw["params"], c.cfg.Logger))
 	case "mcpServer/elicitation/request":
+		if c.enterprise {
+			c.cfg.Logger.Warn("codex: denying MCP elicitation request on enterprise task", "id", id)
+			c.respond(id, map[string]any{"action": "reject"})
+			return
+		}
 		c.respond(id, map[string]any{"action": "accept", "content": nil, "_meta": nil})
 	default:
 		msg := fmt.Sprintf("unsupported codex app-server request: %s", method)
@@ -2938,6 +2954,60 @@ func (c *codexClient) handleServerRequest(raw map[string]json.RawMessage) {
 		c.setTurnError(msg)
 		c.respondError(id, -32601, msg)
 	}
+}
+
+// codexThreadStartParams assembles the thread/start request. Personal tasks
+// inherit approvalPolicy/sandbox from the per-task config.toml (nil here).
+// Enterprise tasks (BND-162) declare their managed parameters explicitly
+// instead of inheriting whatever the user's shared ~/.codex/config.toml
+// happens to hold: approvalPolicy is pinned to the managed value
+// ("untrusted" unless the deployment overrides it). Note "never" produces no
+// approval requests at all; with "on-failure" the app-server's requests would
+// reach the daemon, and the enterprise gate denies them, stalling the task on
+// actions it can never get approved; "untrusted" keeps the session inside
+// the sandbox policy instead. sandbox pins the SAME decision execenv wrote
+// into the task's config.toml so a user-level config cannot loosen the
+// managed session: on macOS that is danger-full-access because Codex's
+// Seatbelt sandbox in workspace-write mode silently ignores
+// sandbox_workspace_write.network_access and the sandboxed CLI cannot reach
+// the Multica API at all (upstream openai/codex#10390); Linux keeps its
+// existing danger-full-access product decision (MUL-5578). When the daemon
+// did not resolve a mode, sandbox stays nil and the task config decides.
+func codexThreadStartParams(opts ExecOptions) map[string]any {
+	params := map[string]any{
+		"model":                  nilIfEmpty(opts.Model),
+		"modelProvider":          nil,
+		"profile":                nil,
+		"cwd":                    opts.Cwd,
+		"approvalPolicy":         nil,
+		"sandbox":                nil,
+		"config":                 nil,
+		"baseInstructions":       nil,
+		"developerInstructions":  nil,
+		"compactPrompt":          nil,
+		"includeApplyPatchTool":  nil,
+		"experimentalRawEvents":  false,
+		"persistExtendedHistory": true,
+	}
+	if opts.Enterprise {
+		params["approvalPolicy"] = managedCodexApprovalPolicy(opts)
+		if mode := strings.TrimSpace(opts.CodexSandboxMode); mode != "" {
+			params["sandbox"] = mode
+		}
+	}
+	return params
+}
+
+// managedCodexApprovalPolicy resolves the thread/start approvalPolicy for an
+// enterprise task. "untrusted" is the managed default: the session stays
+// inside the sandbox policy instead of streaming approval requests the
+// enterprise gate would deny anyway. A deployment may pin another managed
+// value via config; an empty override keeps the default.
+func managedCodexApprovalPolicy(opts ExecOptions) string {
+	if v := strings.TrimSpace(opts.EnterpriseCodexApprovalPolicy); v != "" {
+		return v
+	}
+	return "untrusted"
 }
 
 // codexPermissionsApprovalResponse builds the auto-grant reply for a Codex

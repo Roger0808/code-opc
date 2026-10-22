@@ -21,6 +21,10 @@ import {
 } from "../shared/issue-window";
 import { AUTH_SESSION_STATE_CHANNEL } from "../shared/auth-session";
 import type {
+  EnterpriseAuthBeginResult,
+  EnterpriseCallbackPayload,
+} from "../shared/enterprise";
+import type {
   DaemonStatus,
   LocalRuntimeProbe,
 } from "../shared/daemon-types";
@@ -270,8 +274,12 @@ const daemonAPI = {
   },
   setTargetApiUrl: (url: string): Promise<void> =>
     ipcRenderer.invoke("daemon:set-target-api-url", url),
-  syncToken: (token: string, userId: string): Promise<void> =>
-    ipcRenderer.invoke("daemon:sync-token", token, userId),
+  syncToken: (
+    token: string,
+    userId: string,
+    sessionKind?: "personal" | "enterprise",
+  ): Promise<void> =>
+    ipcRenderer.invoke("daemon:sync-token", token, userId, sessionKind),
   clearToken: (): Promise<void> =>
     ipcRenderer.invoke("daemon:clear-token"),
   reauthenticate: (
@@ -298,6 +306,53 @@ const daemonAPI = {
   },
   openLogFile: (): Promise<{ success: boolean; error?: string }> =>
     ipcRenderer.invoke("daemon:open-log-file"),
+};
+
+const enterpriseAPI = {
+  /**
+   * Open a loopback HTTP listener for the enterprise OAuth-style callback and
+   * return its port plus the one-time state to send to the platform authorize
+   * endpoint. At most one attempt is live at a time.
+   */
+  beginAuth: (): Promise<EnterpriseAuthBeginResult> =>
+    ipcRenderer.invoke("enterprise:begin-auth"),
+  /** Abandon the pending loopback attempt (user cancelled, timeout, error). */
+  cancelAuth: (): Promise<void> => ipcRenderer.invoke("enterprise:cancel-auth"),
+  /**
+   * Subscribe to the loopback callback result pushed by main: either the
+   * authorization code or a terminal error ("expired" | "unavailable").
+   * Returns an unsubscribe function.
+   */
+  onAuthCallback: (
+    callback: (payload: EnterpriseCallbackPayload) => void,
+  ) => subscribeToMainRendererChannel("enterprise:callback", callback),
+  /**
+   * Seal an enterprise credential into the main-process safeStorage vault.
+   * Plaintext crosses IPC only in memory, during the enterprise login flow.
+   */
+  seal: (profile: string, plaintext: string): Promise<void> =>
+    ipcRenderer.invoke("enterprise:seal", profile, plaintext),
+  /** Open a sealed enterprise credential; null when none exists. */
+  open: (profile: string): Promise<string | null> =>
+    ipcRenderer.invoke("enterprise:open", profile),
+  /** Remove a sealed enterprise credential, if present. */
+  delete: (profile: string): Promise<void> =>
+    ipcRenderer.invoke("enterprise:delete", profile),
+  /** Whether a sealed credential exists for the profile. */
+  has: (profile: string): Promise<boolean> =>
+    ipcRenderer.invoke("enterprise:has", profile),
+  /**
+   * Boot-time restore: synchronously read the sealed enterprise session
+   * token, or null when there is none. Runs before the renderer's first
+   * render, which is why this is a sendSync and not an invoke.
+   */
+  restoreSession: (): string | null => {
+    try {
+      return ipcRenderer.sendSync("enterprise:restore") as string | null;
+    } catch {
+      return null;
+    }
+  },
 };
 
 const updaterAPI = {
@@ -333,6 +388,7 @@ if (process.contextIsolated) {
   contextBridge.exposeInMainWorld("electron", electronAPI);
   contextBridge.exposeInMainWorld("desktopAPI", desktopAPI);
   contextBridge.exposeInMainWorld("daemonAPI", daemonAPI);
+  contextBridge.exposeInMainWorld("enterpriseAPI", enterpriseAPI);
   contextBridge.exposeInMainWorld("updater", updaterAPI);
 } else {
   // @ts-expect-error - fallback for non-isolated context
@@ -341,6 +397,8 @@ if (process.contextIsolated) {
   window.desktopAPI = desktopAPI;
   // @ts-expect-error - fallback for non-isolated context
   window.daemonAPI = daemonAPI;
+  // @ts-expect-error - fallback for non-isolated context
+  window.enterpriseAPI = enterpriseAPI;
   // @ts-expect-error - fallback for non-isolated context
   window.updater = updaterAPI;
 }

@@ -822,6 +822,20 @@ WHERE id = @task_id
   AND started_at IS NULL
   AND dispatched_at = @dispatched_at;
 
+-- name: SetTaskEnterpriseSkillsIssued :exec
+-- Record the enterprise skill refs (publish_id + pinned hash) this claim
+-- generation issued in its response. ResolveTaskSkillBundles intersects
+-- daemon resolve requests against this set, so only refs the newest claim
+-- actually handed out can be resolved — a stale handler cannot widen another
+-- claim generation's set (same CAS as SetTaskIssueSnapshot).
+UPDATE agent_task_queue
+SET context = jsonb_set(COALESCE(context, '{}'::jsonb), '{enterprise_skills_issued}', @enterprise_skills_issued::jsonb, true)
+WHERE id = @task_id
+  AND runtime_id = @runtime_id
+  AND status = 'dispatched'
+  AND started_at IS NULL
+  AND dispatched_at = @dispatched_at;
+
 -- name: RequeueAgentTaskAfterClaimFailure :one
 -- Claim finalization (task token + optional comment receipt) failed before any
 -- response bytes were written. Return only that exact claim generation to the

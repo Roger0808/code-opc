@@ -232,6 +232,16 @@ type Client struct {
 	send        chan []byte
 	userID      string
 	workspaceID string
+	// ent is the enterprise identity snapshot of the credential that
+	// authenticated this connection. Non-empty means the connection is
+	// enterprise-managed: the platform revoke push and the periodic epoch
+	// recheck close exactly these — personal connections of the same user
+	// are not enterprise-managed and stay up.
+	ent EnterpriseTokenInfo
+	// done is closed by closeSend (the single teardown funnel) so detached
+	// goroutines — the enterprise epoch recheck loop — exit on any teardown
+	// path. Nil on hand-built test clients; closeSend guards the close.
+	done        chan struct{}
 	writeMu     sync.Mutex // serializes application writes and the final removal notice
 	stopped     atomic.Bool
 
@@ -599,6 +609,34 @@ func (h *Hub) SendToUser(userID string, message []byte, excludeWorkspace ...stri
 	h.fanoutUser(userID, message, exclude, "")
 }
 
+// enterpriseRevokedFrame is the session-ending control frame the platform
+// revoke push delivers to enterprise-managed connections before closing them.
+var enterpriseRevokedFrame = []byte(`{"type":"enterprise_revoked"}`)
+
+// CloseEnterpriseUserConnections closes every enterprise-managed connection
+// belonging to userID, delivering the enterprise_revoked frame first so the
+// client tears its session down (and re-login is the only way back). Personal
+// connections of the same user are not enterprise-managed and stay up.
+// Returns how many connections were closed.
+func (h *Hub) CloseEnterpriseUserConnections(userID string) int {
+	if h == nil || userID == "" {
+		return 0
+	}
+	h.mu.RLock()
+	var targets []*Client
+	for client := range h.clients {
+		if client.userID == userID && !client.ent.Empty() {
+			targets = append(targets, client)
+		}
+	}
+	h.mu.RUnlock()
+	deadline := time.Now().Add(removalNoticeWait)
+	for _, client := range targets {
+		h.stopClient(client, enterpriseRevokedFrame, deadline)
+	}
+	return len(targets)
+}
+
 // Broadcast sends a message to every connected client (daemon events).
 func (h *Hub) Broadcast(message []byte) {
 	h.broadcast <- message
@@ -698,20 +736,60 @@ func (h *Hub) Snapshot() map[string]any {
 	}
 }
 
+// EnterpriseTokenInfo is the enterprise identity snapshot of the credential
+// that authenticated a websocket connection: the session epoch for
+// enterprise JWTs, the subject snapshot for enterprise PATs. Empty means a
+// personal connection, which the enterprise close-out never touches.
+type EnterpriseTokenInfo struct {
+	SessionID  string
+	Version    int64
+	PATSubject string
+}
+
+// Empty reports whether the connection carries no enterprise identity.
+func (e EnterpriseTokenInfo) Empty() bool { return e.SessionID == "" && e.PATSubject == "" }
+
+// EnterprisePATResolver is the optional enterprise extension of PATResolver.
+// Implementations return the enterprise subject snapshot stored on the PAT
+// row (through whatever cache they use); a resolver that does not implement
+// it simply yields personal-only connections.
+type EnterprisePATResolver interface {
+	ResolveTokenEnterprise(ctx context.Context, token string) (userID, enterpriseSubject string, ok bool)
+}
+
+// EnterpriseSessionChecker validates the enterprise epoch of a freshly
+// authenticated connection against the current user row. Returning false
+// means the entitlement is gone: the hub sends {type:"enterprise_revoked"}
+// and closes the connection. Nil disables the check entirely.
+type EnterpriseSessionChecker func(ctx context.Context, userID string, ent EnterpriseTokenInfo) bool
+
 // authenticateToken validates a JWT or PAT string and returns the user ID.
 func authenticateToken(tokenStr string, pr PATResolver, ctx context.Context) (string, string) {
+	uid, _, errMsg := authenticateTokenFull(tokenStr, pr, ctx)
+	return uid, errMsg
+}
+
+// authenticateTokenFull is authenticateToken plus the enterprise identity
+// snapshot carried by the credential, used by the enterprise close-out.
+func authenticateTokenFull(tokenStr string, pr PATResolver, ctx context.Context) (string, EnterpriseTokenInfo, string) {
 	if strings.HasPrefix(tokenStr, "mul_") {
 		if pr == nil {
-			return "", `{"error":"invalid token"}`
+			return "", EnterpriseTokenInfo{}, `{"error":"invalid token"}`
 		}
-		uid, ok := pr.ResolveToken(ctx, tokenStr)
+		var uid, entSubject string
+		var ok bool
+		if er, isEnterprise := pr.(EnterprisePATResolver); isEnterprise {
+			uid, entSubject, ok = er.ResolveTokenEnterprise(ctx, tokenStr)
+		} else {
+			uid, ok = pr.ResolveToken(ctx, tokenStr)
+		}
 		if !ok {
-			return "", `{"error":"invalid token"}`
+			return "", EnterpriseTokenInfo{}, `{"error":"invalid token"}`
 		}
 		if auth.IsTemporarilyDisabledUserID(uid) {
-			return "", `{"error":"account disabled"}`
+			return "", EnterpriseTokenInfo{}, `{"error":"account disabled"}`
 		}
-		return uid, ""
+		return uid, EnterpriseTokenInfo{PATSubject: entSubject}, ""
 	}
 
 	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) {
@@ -721,23 +799,30 @@ func authenticateToken(tokenStr string, pr PATResolver, ctx context.Context) (st
 		return auth.JWTSecret(), nil
 	})
 	if err != nil || !token.Valid {
-		return "", `{"error":"invalid token"}`
+		return "", EnterpriseTokenInfo{}, `{"error":"invalid token"}`
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return "", `{"error":"invalid claims"}`
+		return "", EnterpriseTokenInfo{}, `{"error":"invalid claims"}`
 	}
 
 	uid, ok := claims["sub"].(string)
 	if !ok || strings.TrimSpace(uid) == "" {
-		return "", `{"error":"invalid claims"}`
+		return "", EnterpriseTokenInfo{}, `{"error":"invalid claims"}`
 	}
 	email, _ := claims["email"].(string)
 	if auth.IsTemporarilyDisabledUser(uid, email) {
-		return "", `{"error":"account disabled"}`
+		return "", EnterpriseTokenInfo{}, `{"error":"account disabled"}`
 	}
-	return uid, ""
+	var ent EnterpriseTokenInfo
+	if sid, _ := claims[auth.EnterpriseSessionClaim].(string); sid != "" {
+		ent.SessionID = sid
+		if ver, ok := claims[auth.EnterpriseVersionClaim].(float64); ok {
+			ent.Version = int64(ver)
+		}
+	}
+	return uid, ent, ""
 }
 
 // firstMessageAuth reads the first WebSocket message expecting an auth payload.
@@ -796,6 +881,17 @@ func writeWSAuthErrorAndClose(conn *websocket.Conn, payload []byte, attrs ...any
 // HandleWebSocket upgrades an HTTP connection to WebSocket with cookie or
 // first-message auth.
 func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug SlugResolver, w http.ResponseWriter, r *http.Request) {
+	HandleWebSocketWithEnterprise(hub, mc, pr, resolveSlug, nil, w, r)
+}
+
+// HandleWebSocketWithEnterprise is HandleWebSocket plus the enterprise
+// close-out: once the connection is authenticated, its enterprise epoch is
+// validated, and an entitlement that no longer matches the user row is told
+// so with an {type:"enterprise_revoked"} frame before the server closes the
+// connection. Personal connections (empty EnterpriseTokenInfo) and a nil
+// checker never take this path. Daemon WS channels are authenticated
+// separately and are not affected.
+func HandleWebSocketWithEnterprise(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug SlugResolver, entCheck EnterpriseSessionChecker, w http.ResponseWriter, r *http.Request) {
 	workspaceID := r.URL.Query().Get("workspace_id")
 	if workspaceID == "" {
 		if slug := r.URL.Query().Get("workspace_slug"); slug != "" && resolveSlug != nil {
@@ -813,8 +909,9 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 	}
 
 	var userID string
+	var ent EnterpriseTokenInfo
 	if cookie, err := r.Cookie(auth.AuthCookieName); err == nil && cookie.Value != "" {
-		uid, errMsg := authenticateToken(cookie.Value, pr, r.Context())
+		uid, cookieEnt, errMsg := authenticateTokenFull(cookie.Value, pr, r.Context())
 		if errMsg != "" {
 			status := http.StatusUnauthorized
 			if errMsg == `{"error":"account disabled"}` {
@@ -833,6 +930,7 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 			return
 		}
 		userID = uid
+		ent = cookieEnt
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -855,7 +953,7 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 			writeWSAuthErrorAndClose(conn, []byte(errMsg), "workspace_id", workspaceID)
 			return
 		}
-		uid, errMsg := authenticateToken(tokenStr, pr, r.Context())
+		uid, frameEnt, errMsg := authenticateTokenFull(tokenStr, pr, r.Context())
 		if errMsg != "" {
 			writeWSAuthErrorAndClose(conn, []byte(errMsg), "workspace_id", workspaceID)
 			return
@@ -875,6 +973,7 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 			return
 		}
 		userID = uid
+		ent = frameEnt
 
 		if !writeWSAuthFrame(
 			conn,
@@ -886,6 +985,23 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 			conn.Close()
 			return
 		}
+	}
+
+	// Enterprise close-out: the connection is authenticated but its epoch
+	// may already be stale (revocation landed between the last HTTP request
+	// and this upgrade). Personal connections skip the check. The frame is
+	// sent before the client registers, so no channels are ever opened for
+	// a revoked enterprise session.
+	if entCheck != nil && !ent.Empty() && !entCheck(r.Context(), userID, ent) {
+		writeWSAuthFrame(
+			conn,
+			[]byte(`{"type":"enterprise_revoked"}`),
+			"enterprise_revoked",
+			"workspace_id", workspaceID,
+			"user_id", userID,
+		)
+		conn.Close()
+		return
 	}
 
 	// Capture client metadata from query params (browsers cannot set custom
@@ -909,8 +1025,19 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 		send:        make(chan []byte, 256),
 		userID:      userID,
 		workspaceID: workspaceID,
+		ent:         ent,
+		done:        make(chan struct{}),
 	}
 	hub.register <- client
+
+	// Enterprise epoch recheck (BND-110): connect-time validation is not
+	// enough on its own — the platform push channel may be delayed. An
+	// enterprise-managed connection re-validates its epoch every
+	// enterpriseRecheckInterval; a drifted epoch is closed with the
+	// enterprise_revoked frame, same as the push path.
+	if entCheck != nil && !ent.Empty() {
+		go client.enterpriseRecheckLoop(entCheck)
+	}
 
 	go client.writePump()
 	go client.readPump()
@@ -1091,6 +1218,41 @@ func (c *Client) closeSend() {
 	}
 	c.sendClosed = true
 	close(c.send)
+	if c.done != nil {
+		close(c.done)
+	}
+}
+
+// enterpriseRecheckInterval is how often an enterprise-managed connection
+// re-validates its session epoch against the user row (BND-110). 30s matches
+// the version-cache TTL so a revocation lands within at most one TTL of cache
+// staleness even when the platform push channel is delayed. A var so tests
+// can shrink it; production never reassigns it.
+var enterpriseRecheckInterval = 30 * time.Second
+
+// enterpriseRecheckLoop periodically re-runs the connection's enterprise
+// epoch check until teardown (done) or a failed check, which closes the
+// connection with the enterprise_revoked frame — the same close-out the
+// platform push path uses.
+func (c *Client) enterpriseRecheckLoop(check EnterpriseSessionChecker) {
+	ticker := time.NewTicker(enterpriseRecheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			// Bounded per check: a stuck lookup must not pin this goroutine
+			// past the connection's life; the checker fails closed on errors.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ok := check(ctx, c.userID, c.ent)
+			cancel()
+			if !ok {
+				c.hub.stopClient(c, enterpriseRevokedFrame, time.Now().Add(removalNoticeWait))
+				return
+			}
+		}
+	}
 }
 
 func (c *Client) sendJSON(v any) {

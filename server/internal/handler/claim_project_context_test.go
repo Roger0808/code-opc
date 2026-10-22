@@ -456,7 +456,7 @@ func TestBuildClaimedTaskResponse_SourceLoadFailure_PreservesTaskAndEmitsNoConte
 			req := httptest.NewRequest(http.MethodPost, "/api/daemon/runtimes/"+runtimeID+"/claim", nil)
 
 			resp, _, _, _, _, failure := brokenHandler.buildClaimedTaskResponse(
-				req, &task, runtime, runtimeID, testWorkspaceID)
+				req, &task, runtime, runtimeID, testWorkspaceID, false)
 
 			if failure == nil {
 				t.Fatal("expected the claim to be rejected when its source row cannot be read")

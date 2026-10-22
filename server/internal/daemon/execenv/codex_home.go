@@ -98,7 +98,8 @@ type CodexHomeOptions struct {
 // so the sandbox block it writes is stable regardless of the host running the
 // test.
 func prepareCodexHome(codexHome string, logger *slog.Logger) error {
-	return prepareCodexHomeWithOpts(codexHome, CodexHomeOptions{GOOS: "linux"}, logger)
+	_, err := prepareCodexHomeWithOpts(codexHome, CodexHomeOptions{GOOS: "linux"}, logger)
+	return err
 }
 
 // sharedConfigPresence is the tri-state existence of the shared
@@ -194,8 +195,11 @@ func classifyPerTaskWindowsSandbox(configFile string, configSyncErr error, share
 // prepareCodexHomeWithOpts creates a per-task CODEX_HOME directory and seeds
 // it with config from the shared ~/.codex/ home. Auth is symlinked (shared),
 // config files are copied (isolated). The per-task config.toml gets a
-// daemon-managed sandbox block picked by codexSandboxPolicyFor.
-func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *slog.Logger) error {
+// daemon-managed sandbox block picked by codexSandboxPolicyFor. It returns
+// the resolved sandbox mode (policy.Mode) so callers can restate the same
+// decision on the Codex thread/start RPC for managed enterprise sessions
+// instead of letting them inherit a looser user-level config.
+func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *slog.Logger) (string, error) {
 	sharedHome := resolveSharedCodexHome()
 	freshHome := false
 	if _, err := os.Lstat(codexHome); os.IsNotExist(err) {
@@ -203,7 +207,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 	}
 
 	if err := os.MkdirAll(codexHome, 0o755); err != nil {
-		return fmt.Errorf("create codex-home dir: %w", err)
+		return "", fmt.Errorf("create codex-home dir: %w", err)
 	}
 
 	// Give the task its own local sessions/ directory instead of symlinking the
@@ -254,7 +258,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 	}
 
 	if err := syncCodexReferencedFiles(codexHome, sharedHome); err != nil {
-		return fmt.Errorf("sync codex config file references: %w", err)
+		return "", fmt.Errorf("sync codex config file references: %w", err)
 	}
 
 	// Seed the shared model cache only for a fresh task home. On reuse, keep a
@@ -265,7 +269,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 	if err := syncCodexModelsCache(codexHome, sharedHome, freshHome); err != nil {
 		logger.Warn("execenv: codex-home models cache sync failed; discarding cache", "error", err)
 		if removeErr := os.RemoveAll(filepath.Join(codexHome, codexModelsCacheFile)); removeErr != nil {
-			return fmt.Errorf("sync codex models cache: %v; discard unsafe cache: %w", err, removeErr)
+			return "", fmt.Errorf("sync codex models cache: %v; discard unsafe cache: %w", err, removeErr)
 		}
 	}
 
@@ -296,7 +300,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 		// fails the task; on Reuse the caller declines the reuse and falls back
 		// to Prepare, which re-runs this check against a fresh home and fails
 		// the task if the managed block still cannot be written (MUL-4957).
-		return fmt.Errorf("ensure codex sandbox config: %w", err)
+		return "", fmt.Errorf("ensure codex sandbox config: %w", err)
 	}
 
 	// Disable Codex native multi-agent inside daemon-managed task sessions
@@ -315,7 +319,7 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 		logger.Warn("execenv: codex-home ensure memory config failed", "error", err)
 	}
 
-	return nil
+	return policy.Mode, nil
 }
 
 // resolveSharedCodexHome returns the path to the user's shared Codex home.

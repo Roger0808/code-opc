@@ -23,6 +23,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/cloudruntime"
 	"github.com/multica-ai/multica/server/internal/daemonws"
 	"github.com/multica-ai/multica/server/internal/dbreader"
+	"github.com/multica-ai/multica/server/internal/enterprise"
 	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
@@ -36,6 +37,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/platform"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/seatcapacity"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -267,11 +269,27 @@ type Handler struct {
 	// May be nil in tests / self-hosted with the metrics listener disabled;
 	// every Record* method is nil-safe and obsmetrics.RecordEvent treats a
 	// nil Metrics as "PostHog only".
-	Metrics                      *obsmetrics.BusinessMetrics
-	PATCache                     *auth.PATCache
-	DaemonTokenCache             *auth.DaemonTokenCache
-	MembershipCache              *auth.MembershipCache
-	QoderRateLimiter             WebhookRateLimiter
+	Metrics          *obsmetrics.BusinessMetrics
+	PATCache         *auth.PATCache
+	DaemonTokenCache *auth.DaemonTokenCache
+	MembershipCache  *auth.MembershipCache
+	QoderRateLimiter WebhookRateLimiter
+	// Platform is the OPC platform integration client. Nil disables every
+	// enterprise flow fail-closed: POST /api/enterprise/exchange reports
+	// enterprise_not_configured and enterprise daemon tasks are never
+	// dispatched (the claim lease check cannot verify anything).
+	Platform *platform.Client
+	// PlatformServiceToken authenticates server-to-server calls from the
+	// platform (e.g. the revocation push endpoint). Constant-time compared;
+	// empty means those endpoints are closed (fail closed).
+	PlatformServiceToken string
+	// EnterpriseSkillResolver resolves platform-published enterprise skill
+	// bundles pinned by the BND-142 five-tuple. Nil fails enterprise skill
+	// resolution closed; personal skill resolution never consults it.
+	EnterpriseSkillResolver *enterprise.Resolver
+	// EnterpriseVersionCache backs the enterprise session-epoch middleware
+	// and gives the future platform push channel its invalidation hook.
+	EnterpriseVersionCache *middleware.EnterpriseVersionCache
 	WebhookRateLimiter           WebhookRateLimiter
 	WebhookIPRateLimiter         WebhookRateLimiter
 	WebhookAbsoluteIPRateLimiter WebhookRateLimiter

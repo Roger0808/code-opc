@@ -3813,6 +3813,11 @@ func (e *ClaimDeliveryAuthzError) Error() string {
 // identity fields from the locked rows before the token is inserted. It
 // returns a *ClaimDeliveryAuthzError to reject delivery (every other error
 // rolls the claim back like any other finalize failure).
+//
+// enterpriseSkillsIssued is the JSON-encoded enterprise skill set this claim
+// issued (M-5); non-nil for enterprise claims (including an empty set, which
+// replaces the previous generation's), nil for personal claims (no write).
+// ResolveTaskSkillBundles intersects daemon resolve requests against it.
 func (s *TaskService) FinalizeTaskClaim(
 	ctx context.Context,
 	task db.AgentTaskQueue,
@@ -3821,6 +3826,7 @@ func (s *TaskService) FinalizeTaskClaim(
 	recordCommentReceipt bool,
 	authorize func(qtx *db.Queries, token *db.CreateTaskTokenParams) error,
 	issueSnapshot []byte,
+	enterpriseSkillsIssued []byte,
 	daemonTokens ...db.CreateDaemonTokenParams,
 ) ([]pgtype.UUID, error) {
 	if len(daemonTokens) > 1 {
@@ -3859,6 +3865,19 @@ func (s *TaskService) FinalizeTaskClaim(
 				DispatchedAt:  task.DispatchedAt,
 			}); err != nil {
 				return fmt.Errorf("set task issue snapshot: %w", err)
+			}
+		}
+		if enterpriseSkillsIssued != nil {
+			// Same CAS columns as the snapshot above: only this claim
+			// generation's issued set may be recorded, and a stale handler
+			// cannot widen a newer claim's set after execution has started.
+			if err := qtx.SetTaskEnterpriseSkillsIssued(ctx, db.SetTaskEnterpriseSkillsIssuedParams{
+				EnterpriseSkillsIssued: enterpriseSkillsIssued,
+				TaskID:                 task.ID,
+				RuntimeID:              task.RuntimeID,
+				DispatchedAt:           task.DispatchedAt,
+			}); err != nil {
+				return fmt.Errorf("set task enterprise skills issued: %w", err)
 			}
 		}
 		if !recordCommentReceipt {

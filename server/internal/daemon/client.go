@@ -214,6 +214,11 @@ func daemonCommonCapabilities() []string {
 		protocol.DaemonCapabilityPlatformSkillV1,
 		protocol.DaemonCapabilityCheckoutKeepsWorkV1,
 		protocol.DaemonCapabilityJoinedWakeupsV1,
+		// Enterprise claim protocol (TASK-C02): the daemon accepts the
+		// server-minted enterprise_lease on claim, renews it while the task
+		// runs, honors managed_mcp_status failed-closed semantics and never
+		// merges local MCP config into enterprise tasks.
+		protocol.DaemonCapabilityEnterpriseProtocolV1,
 	}
 }
 
@@ -1318,6 +1323,45 @@ func (c *Client) postJSONViaObserved(ctx context.Context, httpClient *http.Clien
 		return decode(respReader)
 	}
 	return json.NewDecoder(respReader).Decode(respBody)
+}
+
+// RenewEnterpriseLease renews the claim-issued platform lease for an
+// enterprise task (TASK-C02). The current lease token travels as
+// X-Enterprise-Lease; the server revalidates it (signature, task/runtime
+// binding) and proxies the renewal to the platform. A refusal carries the
+// platform's machine-readable code (ENTITLEMENT_REVOKED / LEASE_EXPIRED),
+// which the renewal loop treats as terminal for the task's cloud calls.
+func (c *Client) RenewEnterpriseLease(ctx context.Context, runtimeID, taskID, leaseToken string) (*EnterpriseLeaseData, error) {
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/enterprise-lease/renew",
+		url.PathEscape(runtimeID), url.PathEscape(taskID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, strings.NewReader("{}"))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("X-Enterprise-Lease", leaseToken)
+	c.setIdentityHeaders(req)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, &requestError{Method: http.MethodPost, Path: path, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(data))}
+	}
+	var out EnterpriseLeaseData
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(out.LeaseToken) == "" || strings.TrimSpace(out.GrantID) == "" {
+		return nil, errInvalidResponseBody
+	}
+	return &out, nil
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, respBody any) error {

@@ -444,6 +444,35 @@ type AgentTaskResponse struct {
 	// (no-gap) case and for old daemons.
 	PriorSessionResumeUnavailable bool   `json:"prior_session_resume_unavailable,omitempty"`
 	WorkDir                       string `json:"work_dir,omitempty"` // local working directory pinned for this task; populated once the daemon reports it
+	// ManagedMcpStatus marks enterprise tasks only: ok (non-empty managed
+	// MCP set), empty (workspace resolution succeeded and legitimately
+	// produced an empty set) or failed_closed (resolution failed and the
+	// mcp_config was zeroed to {} — the daemon must NOT fall back to any
+	// local MCP configuration). Personal tasks never set this field.
+	ManagedMcpStatus string `json:"managed_mcp_status,omitempty"`
+	// Enterprise marks an enterprise-protocol task: the runtime workspace is
+	// platform-mirrored and the claim was authorized by a platform lease.
+	// The daemon tightens managed execution parameters on this signal
+	// (permission mode, approval policy, auto-accept gating) and resolves
+	// enterprise skill refs through the pinned-version path. Personal tasks
+	// never set this field.
+	Enterprise bool `json:"enterprise,omitempty"`
+	// EnterpriseLease is the platform grant the SERVER minted for this claim
+	// (INT-102). The daemon renews it for the life of the task via
+	// POST .../enterprise-lease/renew; a renewal refusal (entitlement
+	// revoked, lease expired) stops the task's cloud calls. Nil for personal
+	// tasks.
+	EnterpriseLease *EnterpriseLease `json:"enterprise_lease,omitempty"`
+	// EnterpriseSkills lists the platform-published skills entitled to the
+	// task's originating enterprise user, each pinned to the manifest digest
+	// the platform attests (source "enterprise"; the daemon resolves them
+	// through the pinned-version path exactly like agent skill refs). Only
+	// enterprise tasks set these fields; EnterpriseSkillsStatus reports ok
+	// (non-empty), empty (entitled to nothing) or unavailable (the platform
+	// listing failed — never blocks the claim, the daemon simply runs
+	// without platform skills).
+	EnterpriseSkills       []EnterpriseSkillRef `json:"enterprise_skills,omitempty"`
+	EnterpriseSkillsStatus string               `json:"enterprise_skills_status,omitempty"`
 	// RelativeWorkDir is a privacy-safe display form of WorkDir intended for
 	// the UI. For standard tasks it strips the daemon's workspaces root while
 	// preserving either the legacy or readable workspace/task segments; for local_directory

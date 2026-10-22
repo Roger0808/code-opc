@@ -531,3 +531,68 @@ func TestTransferStatsKeepsHighWaterMark(t *testing.T) {
 	}
 	nilStats.observeResponseStarted()
 }
+
+// TestEnsureTaskSkillBundles_EnterpriseFailedClosed continues the task
+// without a platform skill whose pinned revision is gone (BND-142): the
+// enterprise ref's 422 fails closed for that skill alone, the workspace
+// skill still resolves, and the task is not failed. Personal tasks keep the
+// historical whole-task failure for the same server response.
+func TestEnsureTaskSkillBundles_EnterpriseFailedClosed(t *testing.T) {
+	defer noSleepRetry(t)()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Skills []SkillRefData `json:"skills"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(req.Skills) != 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.Skills[0].Source == "enterprise" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]any{"code": "enterprise_skill_hash_mismatch", "message": "pinned revision gone"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"bundles": []SkillData{makeResolvableSkillBundle(req.Skills[0].ID)}})
+	}))
+	defer srv.Close()
+
+	entRef := SkillRefData{ID: "pub-1", Source: "enterprise", Hash: "sha256:deadbeef"}
+	wsRef := skillRefFromBundle(makeResolvableSkillBundle("skill-1"))
+
+	d := &Daemon{
+		client:     NewClient(srv.URL),
+		skillCache: NewSkillBundleCache(t.TempDir()),
+	}
+	task := &Task{
+		ID:          "task-ent",
+		RuntimeID:   "rt-1",
+		WorkspaceID: "ws-1",
+		Enterprise:  true,
+		Agent:       &AgentData{ID: "agent-1", SkillRefs: []SkillRefData{entRef, wsRef}},
+	}
+	if err := d.ensureTaskSkillBundles(context.Background(), task); err != nil {
+		t.Fatalf("enterprise failed-closed resolve must not fail the task: %v", err)
+	}
+	if len(task.Agent.Skills) != 1 || task.Agent.Skills[0].ID != "skill-1" {
+		t.Fatalf("resolved skills = %+v, want only the workspace skill", task.Agent.Skills)
+	}
+
+	// Personal task with the same server response keeps the historical
+	// behavior: the resolve error fails the preparation.
+	personal := &Task{
+		ID:          "task-personal",
+		RuntimeID:   "rt-1",
+		WorkspaceID: "ws-1",
+		Agent:       &AgentData{ID: "agent-1", SkillRefs: []SkillRefData{entRef, wsRef}},
+	}
+	if err := d.ensureTaskSkillBundles(context.Background(), personal); err == nil {
+		t.Fatal("personal task must keep failing closed on the 422")
+	}
+}

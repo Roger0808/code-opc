@@ -16,6 +16,7 @@ function makeTeardown(
     closeOverlay: vi.fn(),
     clearDaemonToken: vi.fn(async () => {}),
     stopDaemon: vi.fn(async () => {}),
+    clearEnterpriseSession: vi.fn(async () => {}),
     ...overrides,
   };
 }
@@ -32,6 +33,7 @@ describe("tearDownOnLogout", () => {
     expect(t.reportAuthSession).toHaveBeenCalledWith(null);
     expect(t.resetTabs).toHaveBeenCalledOnce();
     expect(t.closeOverlay).toHaveBeenCalledOnce();
+    expect(t.clearEnterpriseSession).toHaveBeenCalledOnce();
     expect(t.clearDaemonToken).toHaveBeenCalledOnce();
     expect(t.stopDaemon).toHaveBeenCalledOnce();
   });
@@ -44,6 +46,18 @@ describe("tearDownOnLogout", () => {
     });
 
     await expect(tearDownOnLogout(t)).resolves.toBeUndefined();
+    expect(t.stopDaemon).toHaveBeenCalledOnce();
+  });
+
+  it("still tears down when the enterprise vault cleanup fails", async () => {
+    const t = makeTeardown({
+      clearEnterpriseSession: vi.fn(async () => {
+        throw new Error("vault unavailable");
+      }),
+    });
+
+    await expect(tearDownOnLogout(t)).resolves.toBeUndefined();
+    expect(t.clearDaemonToken).toHaveBeenCalledOnce();
     expect(t.stopDaemon).toHaveBeenCalledOnce();
   });
 
@@ -80,5 +94,6 @@ describe("tearDownOnSessionExpiry", () => {
     expect(t.reportAuthSession).toHaveBeenCalledWith(null);
     expect(t.resetTabs).toHaveBeenCalledOnce();
     expect(t.closeOverlay).toHaveBeenCalledOnce();
+    expect(t.clearEnterpriseSession).toHaveBeenCalledOnce();
   });
 });

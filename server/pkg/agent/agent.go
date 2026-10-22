@@ -138,6 +138,30 @@ type ExecOptions struct {
 	// EnableTaskSupplement, to accept additional messages; other providers
 	// ignore it.
 	CursorHookCommand []string
+	// Enterprise marks a task dispatched under the enterprise protocol (the
+	// claim response carried the enterprise marker). Backends tighten their
+	// managed execution parameters on this signal: Claude drops
+	// bypassPermissions, Codex pins approvalPolicy/sandbox and stops
+	// auto-accepting approvals, and ACP backends refuse auto-grants. False
+	// keeps every personal-task behavior byte-identical.
+	Enterprise bool
+	// EnterpriseClaudePermissionMode is the managed --permission-mode value
+	// for enterprise tasks (e.g. "default"). Empty means "default";
+	// "bypassPermissions" is rejected by the claude backend because an
+	// enterprise launch must never return to an unmanaged bypass.
+	EnterpriseClaudePermissionMode string
+	// EnterpriseCodexApprovalPolicy is the managed thread/start
+	// approvalPolicy for enterprise tasks (e.g. "untrusted"). Empty means
+	// "untrusted".
+	EnterpriseCodexApprovalPolicy string
+	// CodexSandboxMode is the resolved sandbox mode the daemon wrote into
+	// the task's Codex config.toml (e.g. "danger-full-access" on macOS,
+	// where the Seatbelt bug forces the fallback — see
+	// execenv.codexSandboxPolicyFor). The codex backend passes it
+	// explicitly on thread/start for enterprise tasks so the managed
+	// session cannot inherit a looser user config; empty keeps the
+	// historical nil (inherit from config).
+	CodexSandboxMode string
 	// piMcpExtensionPath is set by piBackend.Execute after it writes the
 	// temporary MCP extension. The daemon does not fill it.
 	piMcpExtensionPath string

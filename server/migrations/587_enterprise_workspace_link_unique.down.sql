@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_enterprise_workspace_link_user_platform;

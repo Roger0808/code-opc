@@ -659,3 +659,27 @@ describe("useRealtimeSync — member:removed", () => {
     await waitFor(() => expect(qc.getQueryData(workspaceKeys.list())).toEqual([]));
   });
 });
+
+describe("useRealtimeSync — enterprise_revoked", () => {
+  it("ends the session through sessionExpired", () => {
+    const sessionExpired = vi.fn();
+    const stores = {
+      authStore: Object.assign(() => ({}), {
+        getState: () => ({ user: { id: "u1" }, sessionExpired }),
+        subscribe: () => () => {},
+        setState: () => {},
+        destroy: () => {},
+      }),
+    } as unknown as RealtimeSyncStores;
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const ws = createMockWs();
+    renderHook(() => useRealtimeSync(ws, stores), { wrapper: createWrapper(qc) });
+
+    const call = vi.mocked(ws.on).mock.calls.find(([event]) => event === "enterprise_revoked");
+    expect(call).toBeDefined();
+    (call![1] as (p: unknown) => void)(undefined);
+
+    expect(sessionExpired).toHaveBeenCalledOnce();
+  });
+});
