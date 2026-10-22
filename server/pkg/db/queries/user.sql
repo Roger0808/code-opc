@@ -90,12 +90,17 @@ RETURNING *;
 -- name: UpdateUserEnterpriseIdentity :one
 -- Refreshes the platform identity binding on a subsequent exchange: a new
 -- session epoch is minted per exchange and the authorization version is
--- re-anchored to whatever the platform currently reports.
+-- re-anchored to whatever the platform currently reports. The platform may
+-- also supply the provisioned knowledge user's real display name/email —
+-- non-empty values replace the enterprise-<subject> placeholders so the
+-- client UI shows the corporate identity; empty strings leave both as-is.
 UPDATE "user" SET
     enterprise_subject = COALESCE($2, enterprise_subject),
     enterprise_identity_link_id = COALESCE($3, enterprise_identity_link_id),
     enterprise_authz_version = COALESCE($4, enterprise_authz_version),
     enterprise_session_id = COALESCE($5, enterprise_session_id),
+    name = COALESCE(NULLIF($6::text, ''), name),
+    email = COALESCE(NULLIF($7::text, ''), email),
     updated_at = now()
 WHERE id = $1
 RETURNING *;

@@ -142,6 +142,8 @@ type CodeExchangeResponse struct {
 	KnowledgeUserID string  `json:"knowledge_user_id"`
 	CodeUserID      string  `json:"code_user_id"`
 	AuthzVersion    int64   `json:"authz_version"`
+	Email           string  `json:"email"`
+	Name            string  `json:"name"`
 	Spaces          []Space `json:"spaces"`
 }
 

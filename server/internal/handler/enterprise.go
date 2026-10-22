@@ -198,6 +198,17 @@ func (h *Handler) upsertEnterpriseUser(ctx context.Context, ident platform.CodeE
 	if linkID == "" {
 		linkID = ident.KnowledgeUserID
 	}
+	// 平台供给时可带回 knowledge 用户的真实姓名/邮箱；缺省回退
+	// enterprise-<subject> 占位（create 路径必须非空，update 路径传空
+	// 表示不覆盖既有值）。
+	displayName := strings.TrimSpace(ident.Name)
+	if displayName == "" {
+		displayName = "enterprise-" + ident.Subject
+	}
+	email := strings.TrimSpace(ident.Email)
+	if email == "" {
+		email = enterpriseLocalEmail(ident.Subject)
+	}
 	if existing, err := h.Queries.GetUserByEnterpriseSubject(ctx, pgtype.Text{String: ident.Subject, Valid: true}); err == nil {
 		return h.Queries.UpdateUserEnterpriseIdentity(ctx, db.UpdateUserEnterpriseIdentityParams{
 			ID:                       existing.ID,
@@ -205,6 +216,8 @@ func (h *Handler) upsertEnterpriseUser(ctx context.Context, ident platform.CodeE
 			EnterpriseIdentityLinkID: pgtype.Text{String: linkID, Valid: linkID != ""},
 			EnterpriseAuthzVersion:   pgtype.Int8{Int64: ident.AuthzVersion, Valid: true},
 			EnterpriseSessionID:      pgtype.Text{String: sessionID, Valid: true},
+			Column6:                  displayName,
+			Column7:                  email,
 		})
 	} else if !isNotFound(err) {
 		return db.User{}, err
@@ -213,8 +226,8 @@ func (h *Handler) upsertEnterpriseUser(ctx context.Context, ident platform.CodeE
 	// New identity: placeholder email names the origin; the unique subject
 	// index is what subsequent exchanges key on.
 	user, err := h.Queries.CreateEnterpriseUser(ctx, db.CreateEnterpriseUserParams{
-		Name:                     "enterprise-" + ident.Subject,
-		Email:                    enterpriseLocalEmail(ident.Subject),
+		Name:                     displayName,
+		Email:                    email,
 		EnterpriseSubject:        pgtype.Text{String: ident.Subject, Valid: true},
 		EnterpriseIdentityLinkID: pgtype.Text{String: linkID, Valid: linkID != ""},
 		EnterpriseAuthzVersion:   pgtype.Int8{Int64: ident.AuthzVersion, Valid: true},
@@ -238,6 +251,8 @@ func (h *Handler) upsertEnterpriseUser(ctx context.Context, ident platform.CodeE
 		EnterpriseIdentityLinkID: pgtype.Text{String: linkID, Valid: linkID != ""},
 		EnterpriseAuthzVersion:   pgtype.Int8{Int64: ident.AuthzVersion, Valid: true},
 		EnterpriseSessionID:      pgtype.Text{String: sessionID, Valid: true},
+		Column6:                  displayName,
+		Column7:                  email,
 	})
 }
 
