@@ -1,28 +1,28 @@
 {
-  "schemaVersion": 1,
-  "protocol": "sdd-solo@1",
-  "demandId": "OPC-INTEGRATION-001",
-  "deliveryMode": "full",
-  "exportedAt": "2026-10-21T20:10:40+08:00",
-  "snapshotReadonly": true,
-  "repository": {
-    "repositoryId": "code-opc",
-    "remote": "https://github.com/Roger0808/code-opc.git"
-  },
-  "authority": {
-    "remote": "https://github.com/Roger0808/work-opc.git",
-    "commit": "806a40a5e7d0c623d66d92e37830b769bfc3d5e4",
-    "requirementsSha256": "sha256:9c63a8c01548da0c573c166e3eb64a9bcd7433b770da35bb69f1f6ea7761cac9"
-  },
-  "requirementsPath": "docs/loops/demands/OPC-INTEGRATION-001/loop-1/requirements.md",
-  "files": {
-    "requirements.md": "sha256:9c63a8c01548da0c573c166e3eb64a9bcd7433b770da35bb69f1f6ea7761cac9",
-    "contracts.md": "sha256:7041e63a535cee113f64f2a3c4768baa68160447f60c363b71db1805955fbd8b",
-    "dependencies.md": "sha256:dbbc57970fbc1e50243dc9765548f76cb7b40f565fd96001738088b8ebaa5db4",
-    "repository/tasks.md": "sha256:dfb280959e0783d0b8b3ed3546cd8773454dfcbb0559e9f47d7094cbf02e69b3",
-    "repository/implementation.md": "sha256:7d69f387fe9d14695fe419cf76a3600b405099354ccf7b72e36815ce8e9400b7",
-    "repository/verification.md": "sha256:8676dcc3614d48f40c6dbac338382dc6f61b0562ed59430aa2130b8cc65d8b84",
-    "repository/review.md": "sha256:2170ea54fa1b03198e68ceceb684f90df61ed37d5875a594c53cab8e013184e2",
-    "repository/repository-receipt.json": "sha256:5238233d933a8a9f1455ced890067d147a5e19844dbd663ff632bf519e4949cc"
-  }
+ "schemaVersion": 1,
+ "protocol": "sdd-solo@1",
+ "demandId": "OPC-INTEGRATION-001",
+ "deliveryMode": "full",
+ "exportedAt": "2026-10-22T13:10:17+08:00",
+ "snapshotReadonly": true,
+ "repository": {
+  "repositoryId": "code-opc",
+  "remote": "https://github.com/Roger0808/code-opc.git"
+ },
+ "authority": {
+  "remote": "https://github.com/Roger0808/work-opc.git",
+  "commit": "3f858592729e12bd82033044d47c4ccee7a7e0be",
+  "requirementsSha256": "sha256:9c63a8c01548da0c573c166e3eb64a9bcd7433b770da35bb69f1f6ea7761cac9"
+ },
+ "requirementsPath": "docs/loops/demands/OPC-INTEGRATION-001/loop-1/requirements.md",
+ "files": {
+  "requirements.md": "sha256:9c63a8c01548da0c573c166e3eb64a9bcd7433b770da35bb69f1f6ea7761cac9",
+  "contracts.md": "sha256:7041e63a535cee113f64f2a3c4768baa68160447f60c363b71db1805955fbd8b",
+  "dependencies.md": "sha256:dbbc57970fbc1e50243dc9765548f76cb7b40f565fd96001738088b8ebaa5db4",
+  "repository/tasks.md": "sha256:dfb280959e0783d0b8b3ed3546cd8773454dfcbb0559e9f47d7094cbf02e69b3",
+  "repository/implementation.md": "sha256:7d69f387fe9d14695fe419cf76a3600b405099354ccf7b72e36815ce8e9400b7",
+  "repository/verification.md": "sha256:8676dcc3614d48f40c6dbac338382dc6f61b0562ed59430aa2130b8cc65d8b84",
+  "repository/review.md": "sha256:2170ea54fa1b03198e68ceceb684f90df61ed37d5875a594c53cab8e013184e2",
+  "repository/repository-receipt.json": "sha256:5238233d933a8a9f1455ced890067d147a5e19844dbd663ff632bf519e4949cc"
+ }
 }
