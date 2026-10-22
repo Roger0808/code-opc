@@ -451,3 +451,68 @@ func TestListInternalSkillsOmitsEmptyTenantAndToleratesFlatDigest(t *testing.T) 
 		t.Fatal("empty subject accepted")
 	}
 }
+
+// TestGetAuthzParsesSubjectKeyedView locks the real INT-102b wire shape:
+// the platform answers {<subject>: {authz_version, revoked, entitlements}}
+// (both GET single and POST batch). A flat-shape misparse once made the
+// refresher read entitled=false and force-bump local versions, locking
+// every enterprise session out with 401s.
+func TestGetAuthzParsesSubjectKeyedView(t *testing.T) {
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/integration/v1/internal/authz" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("subject") != "sub-1" {
+			t.Errorf("subject = %q", r.URL.Query().Get("subject"))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sub-1": map[string]any{
+				"authz_version": 7,
+				"revoked":       false,
+				"entitlements":  []string{"member"},
+			},
+		})
+	}))
+
+	out, err := client.GetAuthz(context.Background(), "sub-1", "")
+	if err != nil {
+		t.Fatalf("GetAuthz: %v", err)
+	}
+	if out.Subject != "sub-1" || out.AuthzVersion != 7 || !out.Entitled {
+		t.Fatalf("unexpected authz view: %+v", out)
+	}
+}
+
+func TestGetAuthzRevokedOrEmptyEntitlementsNotEntitled(t *testing.T) {
+	cases := []struct {
+		name string
+		view map[string]any
+	}{
+		{"revoked", map[string]any{"authz_version": 3, "revoked": true, "entitlements": []string{}}},
+		{"no-entitlements", map[string]any{"authz_version": 3, "revoked": false, "entitlements": []string{}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			view := tc.view
+			client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"sub-1": view})
+			}))
+			out, err := client.GetAuthz(context.Background(), "sub-1", "")
+			if err != nil {
+				t.Fatalf("GetAuthz: %v", err)
+			}
+			if out.Entitled {
+				t.Fatalf("expected not entitled: %+v", out)
+			}
+		})
+	}
+}
+
+func TestGetAuthzMissingSubjectFailsClosed(t *testing.T) {
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"someone-else": map[string]any{}})
+	}))
+	if _, err := client.GetAuthz(context.Background(), "sub-1", ""); err == nil {
+		t.Fatal("expected error when the view omits the requested subject")
+	}
+}

@@ -392,18 +392,42 @@ type AuthzResponse struct {
 	Raw          json.RawMessage
 }
 
-// GetAuthz fetches the current authorization record for a subject (INT-102).
+// GetAuthz fetches the current authorization record for a subject (INT-102b).
+// The platform wire shape keys the view by subject —
+// {<subject>: {authz_version, revoked, entitlements}} — for both the GET
+// single-subject and POST batch variants; parse that map instead of hoping
+// for a flat body. Entitlement presence (active identity link plus at least
+// one active managed entitlement) maps onto Entitled; a misparsed zero value
+// would make the refresher force-version-bump and lock every enterprise
+// session out with 401s.
 func (c *Client) GetAuthz(ctx context.Context, subject, tenantID string) (AuthzResponse, error) {
 	query := url.Values{}
 	query.Set("subject", subject)
 	if tenantID != "" {
 		query.Set("tenant", tenantID)
 	}
-	var out AuthzResponse
-	if err := c.do(ctx, http.MethodGet, "/integration/v1/internal/authz?"+query.Encode(), nil, &out); err != nil {
+	var raw map[string]json.RawMessage
+	if err := c.do(ctx, http.MethodGet, "/integration/v1/internal/authz?"+query.Encode(), nil, &raw); err != nil {
 		return AuthzResponse{}, err
 	}
-	return out, nil
+	payload, ok := raw[subject]
+	if !ok {
+		return AuthzResponse{}, &APIError{StatusCode: 404, Code: CodeEntitlementRevoked, Message: "platform authz view missing subject"}
+	}
+	var view struct {
+		AuthzVersion int64    `json:"authz_version"`
+		Revoked      bool     `json:"revoked"`
+		Entitlements []string `json:"entitlements"`
+	}
+	if err := json.Unmarshal(payload, &view); err != nil {
+		return AuthzResponse{}, fmt.Errorf("platform authz view decode: %w", err)
+	}
+	return AuthzResponse{
+		Subject:      subject,
+		AuthzVersion: view.AuthzVersion,
+		Entitled:     !view.Revoked && len(view.Entitlements) > 0,
+		Raw:          payload,
+	}, nil
 }
 
 // SkillPackage is one INT-142 enterprise skill download: the package bytes
