@@ -30,12 +30,20 @@ import (
 // the user row so a revoked authorization cannot ride a renewed session.
 
 // EnterpriseExchangeRequest is the body of POST /api/enterprise/exchange.
+// Exactly one credential shape is required:
+//   - Code: the loopback one-time authorization code from INT-101 callback,
+//     which this server first trades at the platform token endpoint for the
+//     exchange token (Device is the desktop fingerprint forwarded there);
+//   - ExchangeToken: a pre-obtained exchange token, kept for callers that
+//     completed the token step themselves.
 // CodeVerifier is the desktop's PKCE verifier for the login transaction: the
-// platform requires it on code-exchange and rejects an S256 mismatch with
-// 400 AUTH_STATE_MISMATCH.
+// platform requires it on both the token step and code-exchange and rejects
+// an S256 mismatch with 400 AUTH_STATE_MISMATCH.
 type EnterpriseExchangeRequest struct {
 	ExchangeToken string `json:"exchange_token"`
+	Code          string `json:"code"`
 	CodeVerifier  string `json:"code_verifier"`
+	Device        string `json:"device"`
 }
 
 // enterpriseLocalEmail builds the placeholder mailbox for a platform-managed
@@ -97,16 +105,34 @@ func (h *Handler) EnterpriseExchange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if strings.TrimSpace(req.ExchangeToken) == "" {
-		writeError(w, http.StatusBadRequest, "exchange_token is required")
-		return
-	}
 	if strings.TrimSpace(req.CodeVerifier) == "" {
 		writeError(w, http.StatusBadRequest, "code_verifier is required")
 		return
 	}
+	exchangeToken := strings.TrimSpace(req.ExchangeToken)
+	if exchangeToken == "" {
+		code := strings.TrimSpace(req.Code)
+		if code == "" {
+			writeError(w, http.StatusBadRequest, "code or exchange_token is required")
+			return
+		}
+		// INT-101: the loopback callback yields a one-time authorization
+		// code, not the exchange token code-exchange expects. Trade it at
+		// the platform token endpoint first (PKCE re-check, atomic consume);
+		// platform 4xx codes (replay, expiry) pass through unchanged.
+		tokenResp, err := h.Platform.ExchangeCode(r.Context(), platform.ExchangeCodeRequest{
+			Code:         code,
+			CodeVerifier: strings.TrimSpace(req.CodeVerifier),
+			Device:       strings.TrimSpace(req.Device),
+		})
+		if err != nil {
+			h.writePlatformError(w, r, err)
+			return
+		}
+		exchangeToken = tokenResp.ExchangeToken
+	}
 
-	ident, err := h.Platform.CodeExchange(r.Context(), strings.TrimSpace(req.ExchangeToken), strings.TrimSpace(req.CodeVerifier))
+	ident, err := h.Platform.CodeExchange(r.Context(), exchangeToken, strings.TrimSpace(req.CodeVerifier))
 	if err != nil {
 		h.writePlatformError(w, r, err)
 		return

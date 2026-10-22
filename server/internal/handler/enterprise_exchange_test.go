@@ -15,28 +15,50 @@ import (
 	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
-// platformStub serves the INT-101g contract for exchange tests.
+// platformStub serves the INT-101 contract for exchange tests: the token
+// step (one-time code -> exchange token) and the code-exchange step are
+// stubbed independently so each test can assert exactly what reached each
+// platform endpoint. A nil tokenBody defaults to a successful token step.
 type platformStub struct {
-	t        *testing.T
-	status   int
-	body     map[string]any
-	requests int
-	token    string
-	verifier string
+	t *testing.T
+
+	token         string            // last Authorization header
+	verifier      string            // last code-exchange code_verifier
+	exchangeToken string            // last code-exchange exchange_token
+	tokenReq      map[string]string // last /auth/token request body
+
+	tokenStatus    int
+	tokenBody      map[string]any
+	exchangeStatus int
+	exchangeBody   map[string]any
 }
 
 func (ps *platformStub) handler() *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ps.requests++
 		ps.token = r.Header.Get("Authorization")
-		var reqBody struct {
-			CodeVerifier string `json:"code_verifier"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&reqBody)
-		ps.verifier = reqBody.CodeVerifier
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(ps.status)
-		_ = json.NewEncoder(w).Encode(ps.body)
+		switch r.URL.Path {
+		case "/integration/v1/auth/token":
+			_ = json.NewDecoder(r.Body).Decode(&ps.tokenReq)
+			status, body := ps.tokenStatus, ps.tokenBody
+			if body == nil {
+				status, body = http.StatusOK, map[string]any{"exchange_token": "xtok-from-code"}
+			}
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(body)
+		case "/integration/v1/auth/code-exchange":
+			var reqBody struct {
+				ExchangeToken string `json:"exchange_token"`
+				CodeVerifier  string `json:"code_verifier"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&reqBody)
+			ps.exchangeToken = reqBody.ExchangeToken
+			ps.verifier = reqBody.CodeVerifier
+			w.WriteHeader(ps.exchangeStatus)
+			_ = json.NewEncoder(w).Encode(ps.exchangeBody)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	ps.t.Cleanup(server.Close)
 	return server
@@ -78,7 +100,7 @@ func TestEnterpriseExchangeSuccess(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
-	stub := &platformStub{t: t, status: http.StatusOK, body: exchangeSuccessBody("sub-x", 42)}
+	stub := &platformStub{t: t, exchangeStatus: http.StatusOK, exchangeBody: exchangeSuccessBody("sub-x", 42)}
 	server := stub.handler()
 	previous := testHandler.Platform
 	testHandler.Platform = mustPlatformClient(t, server.URL)
@@ -93,6 +115,12 @@ func TestEnterpriseExchangeSuccess(t *testing.T) {
 	}
 	if stub.verifier != "verifier-1" {
 		t.Fatalf("code_verifier not forwarded to the platform: %q", stub.verifier)
+	}
+	if stub.exchangeToken != "xtok" {
+		t.Fatalf("exchange_token not forwarded to code-exchange: %q", stub.exchangeToken)
+	}
+	if stub.tokenReq != nil {
+		t.Fatalf("token step must not be called on the exchange_token path: %v", stub.tokenReq)
 	}
 
 	var resp LoginResponse
@@ -148,6 +176,137 @@ func TestEnterpriseExchangeSuccess(t *testing.T) {
 	})
 }
 
+// TestEnterpriseExchangeTradesCodeForExchangeToken pins the INT-101 two-step
+// the loopback callback actually yields a one-time authorization code, not an
+// exchange token: the proxy must first call the platform token endpoint
+// (grant_type=authorization_code, desktop client id, code-backend audience,
+// PKCE verifier and device fingerprint) and only then code-exchange with the
+// returned exchange token.
+func TestEnterpriseExchangeTradesCodeForExchangeToken(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	stub := &platformStub{t: t, exchangeStatus: http.StatusOK, exchangeBody: exchangeSuccessBody("sub-code", 7)}
+	server := stub.handler()
+	previous := testHandler.Platform
+	testHandler.Platform = mustPlatformClient(t, server.URL)
+	t.Cleanup(func() { testHandler.Platform = previous })
+
+	rec := testutil.Call(t, testHandler.EnterpriseExchange,
+		exchangeRequest(`{"code":"loopback-code-1","code_verifier":"verifier-9","device":"dev-9"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	if stub.tokenReq == nil {
+		t.Fatal("platform token step was not called")
+	}
+	wantTokenReq := map[string]string{
+		"grant_type":    "authorization_code",
+		"code":          "loopback-code-1",
+		"code_verifier": "verifier-9",
+		"client_id":     "code-desktop",
+		"device":        "dev-9",
+		"audience":      "code-backend",
+	}
+	for k, want := range wantTokenReq {
+		if got := stub.tokenReq[k]; got != want {
+			t.Fatalf("token request %s = %q, want %q (body %v)", k, got, want, stub.tokenReq)
+		}
+	}
+	if stub.exchangeToken != "xtok-from-code" {
+		t.Fatalf("code-exchange exchange_token = %q, want the token-step result", stub.exchangeToken)
+	}
+	if stub.verifier != "verifier-9" {
+		t.Fatalf("code-exchange code_verifier = %q", stub.verifier)
+	}
+	if stub.token != "Bearer svc" {
+		t.Fatalf("service token not presented to code-exchange: %q", stub.token)
+	}
+
+	var resp LoginResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	claims := decodeLoginToken(t, resp.Token)
+	if claims[auth.EnterpriseVersionClaim] != float64(7) {
+		t.Fatalf("ent_ver = %v, want 7", claims[auth.EnterpriseVersionClaim])
+	}
+
+	var userID string
+	dbfx.QueryRow(t, `SELECT id FROM "user" WHERE enterprise_subject = 'sub-code'`).Scan(&userID)
+	t.Cleanup(func() {
+		ctx := context.Background()
+		testPool.Exec(ctx, `DELETE FROM workspace WHERE id IN (
+			SELECT workspace_id FROM enterprise_workspace_link WHERE user_id = $1
+		)`, userID)
+		testPool.Exec(ctx, `DELETE FROM enterprise_workspace_link WHERE user_id = $1`, userID)
+		testPool.Exec(ctx, `DELETE FROM member WHERE user_id = $1`, userID)
+		testPool.Exec(ctx, `DELETE FROM "user" WHERE id = $1`, userID)
+	})
+}
+
+// TestEnterpriseExchangeTokenStepPlatformError: a 4xx from the platform token
+// step (replay, expiry, S256 mismatch) passes its machine-readable code
+// through to the desktop untouched, and code-exchange is never reached.
+func TestEnterpriseExchangeTokenStepPlatformError(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	previous := testHandler.Platform
+	t.Cleanup(func() { testHandler.Platform = previous })
+
+	cases := []struct {
+		name       string
+		status     int
+		body       map[string]any
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "code replayed",
+			status:     http.StatusBadRequest,
+			body:       map[string]any{"code": "AUTH_CODE_REPLAYED", "message": "authorization code replayed or expired"},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "AUTH_CODE_REPLAYED",
+		},
+		{
+			name:       "pkce mismatch",
+			status:     http.StatusBadRequest,
+			body:       map[string]any{"code": "AUTH_STATE_MISMATCH", "message": "code_verifier does not match challenge"},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "AUTH_STATE_MISMATCH",
+		},
+		{
+			name:       "token step outage",
+			status:     http.StatusBadGateway,
+			body:       map[string]any{"error": "upstream down"},
+			wantStatus: http.StatusBadGateway,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &platformStub{t: t, tokenStatus: tc.status, tokenBody: tc.body}
+			server := stub.handler()
+			testHandler.Platform = mustPlatformClient(t, server.URL)
+
+			rec := testutil.Call(t, testHandler.EnterpriseExchange,
+				exchangeRequest(`{"code":"c-x","code_verifier":"v-x"}`))
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (%s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantCode != "" {
+				if got := errorCode(t, rec.Body.String()); got != tc.wantCode {
+					t.Fatalf("code = %q, want %q", got, tc.wantCode)
+				}
+			}
+			if stub.exchangeToken != "" {
+				t.Fatalf("code-exchange must not run after a failed token step (got %q)", stub.exchangeToken)
+			}
+		})
+	}
+}
+
 // TestEnterpriseExchangeMirrorsSpaceRoles pins the role mapping: the
 // platform's per-space role (viewer/contributor/admin/owner) decides the
 // mirrored member row — viewer/contributor collapse to member, missing or
@@ -164,7 +323,7 @@ func TestEnterpriseExchangeMirrorsSpaceRoles(t *testing.T) {
 		{"id": "pw-owner", "tenant": "acme", "role": "owner"},
 		{"id": "pw-bare", "tenant": "acme"},
 	}
-	stub := &platformStub{t: t, status: http.StatusOK, body: body}
+	stub := &platformStub{t: t, exchangeStatus: http.StatusOK, exchangeBody: body}
 	server := stub.handler()
 	previous := testHandler.Platform
 	testHandler.Platform = mustPlatformClient(t, server.URL)
@@ -211,7 +370,7 @@ func TestEnterpriseExchangeIdempotentUser(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
-	stub := &platformStub{t: t, status: http.StatusOK, body: exchangeSuccessBody("sub-replay", 1)}
+	stub := &platformStub{t: t, exchangeStatus: http.StatusOK, exchangeBody: exchangeSuccessBody("sub-replay", 1)}
 	server := stub.handler()
 	previous := testHandler.Platform
 	testHandler.Platform = mustPlatformClient(t, server.URL)
@@ -228,7 +387,7 @@ func TestEnterpriseExchangeIdempotentUser(t *testing.T) {
 
 	// Platform moves the version forward; re-exchange must reuse the user,
 	// mint a fresh session epoch and update the version — never duplicate.
-	stub.body = exchangeSuccessBody("sub-replay", 2)
+	stub.exchangeBody = exchangeSuccessBody("sub-replay", 2)
 	second := testutil.Call(t, testHandler.EnterpriseExchange, exchangeRequest(`{"exchange_token":"b","code_verifier":"v-b"}`))
 	if second.Code != http.StatusOK {
 		t.Fatalf("second exchange: %d (%s)", second.Code, second.Body.String())
@@ -301,7 +460,7 @@ func TestEnterpriseExchangePlatformErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			stub := &platformStub{t: t, status: tc.status, body: tc.body}
+			stub := &platformStub{t: t, exchangeStatus: tc.status, exchangeBody: tc.body}
 			server := stub.handler()
 			testHandler.Platform = mustPlatformClient(t, server.URL)
 
@@ -340,11 +499,22 @@ func TestEnterpriseExchangeRequiresConfigurationAndBody(t *testing.T) {
 		t.Fatalf("missing token: status = %d", rec.Code)
 	}
 
-	// The PKCE verifier is mandatory: the platform re-checks it (S256) before
-	// releasing the identity, so the proxy must refuse to forward without one.
+	// Neither credential shape: code and exchange_token are both absent.
+	rec = testutil.Call(t, testHandler.EnterpriseExchange, exchangeRequest(`{"code_verifier":"v-x"}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing code and exchange_token: status = %d", rec.Code)
+	}
+
+	// The PKCE verifier is mandatory on both credential shapes: the platform
+	// re-checks it (S256) before releasing the identity, so the proxy must
+	// refuse to forward without one.
 	rec = testutil.Call(t, testHandler.EnterpriseExchange, exchangeRequest(`{"exchange_token":"x"}`))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("missing code_verifier: status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	rec = testutil.Call(t, testHandler.EnterpriseExchange, exchangeRequest(`{"code":"c-x"}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code shape missing code_verifier: status = %d (%s)", rec.Code, rec.Body.String())
 	}
 }
 

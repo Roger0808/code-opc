@@ -78,6 +78,15 @@ type Config struct {
 // empty.
 const DefaultIssuer = "platform"
 
+// DesktopClientID is the pre-registered INT-101 client id of the code
+// desktop app; every desktop login call (authorize, token) is made under it.
+const DesktopClientID = "code-desktop"
+
+// AudienceCodeBackend selects the INT-101 token audience the code server
+// needs: a one-time exchange token (JWT, aud=code-backend, 120s, single
+// use) that code-exchange consumes, instead of a work-session token pair.
+const AudienceCodeBackend = "code-backend"
+
 // maxSkillPackageBytes bounds one INT-142 skill package download. Skill
 // bundles are text payloads; anything past this is a misbehaving platform
 // and must fail closed instead of filling the cache disk.
@@ -170,6 +179,54 @@ func (s *Space) UnmarshalJSON(data []byte) error {
 		s.Tenant = wire.TenantID
 	}
 	return nil
+}
+
+// ExchangeCodeRequest is the INT-101 token request for the desktop login:
+// the loopback one-time authorization code plus the login transaction's
+// PKCE verifier. Device is the desktop fingerprint the platform binds the
+// exchange token to; empty is accepted.
+type ExchangeCodeRequest struct {
+	Code         string
+	CodeVerifier string
+	Device       string
+}
+
+// ExchangeCodeResponse is the platform answer for audience=code-backend:
+// the one-time exchange token CodeExchange consumes.
+type ExchangeCodeResponse struct {
+	ExchangeToken string `json:"exchange_token"`
+}
+
+// ExchangeCode performs the INT-101 token step: trade the one-time loopback
+// authorization code for the exchange token. Like Authorize this endpoint
+// is public by contract — the login transaction is not complete yet, so no
+// caller credential exists — hence no service token. The platform consumes
+// the code atomically and rejects a PKCE S256 mismatch with 400
+// AUTH_STATE_MISMATCH; a 4xx/5xx becomes *APIError so callers can map
+// platform codes (replay, expiry) to local responses.
+func (c *Client) ExchangeCode(ctx context.Context, req ExchangeCodeRequest) (ExchangeCodeResponse, error) {
+	if strings.TrimSpace(req.Code) == "" {
+		return ExchangeCodeResponse{}, errors.New("platform token exchange requires a code")
+	}
+	body, err := json.Marshal(map[string]string{
+		"grant_type":    "authorization_code",
+		"code":          req.Code,
+		"code_verifier": req.CodeVerifier,
+		"client_id":     DesktopClientID,
+		"device":        req.Device,
+		"audience":      AudienceCodeBackend,
+	})
+	if err != nil {
+		return ExchangeCodeResponse{}, err
+	}
+	var out ExchangeCodeResponse
+	if err := c.doNoAuth(ctx, http.MethodPost, "/integration/v1/auth/token", body, &out); err != nil {
+		return ExchangeCodeResponse{}, err
+	}
+	if strings.TrimSpace(out.ExchangeToken) == "" {
+		return ExchangeCodeResponse{}, errors.New("platform token response missing exchange_token")
+	}
+	return out, nil
 }
 
 // CodeExchange performs INT-101g: exchange a one-time desktop login token

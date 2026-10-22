@@ -53,8 +53,7 @@ export function DesktopLoginPage() {
         onAuthCallback: (callback) =>
           window.enterpriseAPI.onAuthCallback(callback),
         openExternal: (url) => window.desktopAPI.openExternal(url),
-        exchange: (code, codeVerifier) =>
-          exchangeEnterpriseCode(apiUrl, code, codeVerifier),
+        exchange: (input) => exchangeEnterpriseCode(apiUrl, input),
         begin: (input) => beginEnterpriseLogin(apiUrl, input),
       });
       // Publishes the session and seals the token in the main-process vault.

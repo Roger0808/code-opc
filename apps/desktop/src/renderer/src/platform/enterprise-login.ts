@@ -28,6 +28,19 @@ export interface EnterpriseExchangeResult {
   user: User;
 }
 
+/**
+ * Body of POST /api/enterprise/exchange for the loopback code path. The
+ * authorization code the browser came back with is one-time; the code server
+ * trades it at the platform token endpoint (with the PKCE verifier and the
+ * desktop device fingerprint) for the exchange token, then runs the
+ * code-exchange step. `device` is optional and passes through when present.
+ */
+export interface EnterpriseExchangeInput {
+  code: string;
+  code_verifier: string;
+  device?: string;
+}
+
 // The exchange response feeds the shared auth store, so validate the fields
 // the store reads and default the rest like UserSchema does — a malformed
 // response fails the login loudly instead of corrupting downstream state.
@@ -74,22 +87,27 @@ function exchangeErrorMessage(raw: unknown, status: number): string {
 
 /**
  * Trade the loopback authorization code for a local enterprise session.
- * The PKCE verifier is forwarded as `code_verifier`: the platform re-checks
- * it against the begin-time challenge (S256) before releasing the identity,
- * and rejects a mismatch with 400 AUTH_STATE_MISMATCH.
- * Throws with the server's message (or an HTTP status fallback) on failure.
+ * The code is submitted as `code` together with the attempt's PKCE
+ * `code_verifier` — the code server forwards both to the platform token
+ * endpoint (S256 re-check against the begin-time challenge, 400
+ * AUTH_STATE_MISMATCH on mismatch) and then code-exchanges the resulting
+ * exchange token. Throws with the server's message (or an HTTP status
+ * fallback) on failure.
  */
 export async function exchangeEnterpriseCode(
   apiUrl: string,
-  code: string,
-  codeVerifier: string,
+  input: EnterpriseExchangeInput,
 ): Promise<EnterpriseExchangeResult> {
   const res = await fetch(
     `${apiUrl.replace(/\/+$/, "")}/api/enterprise/exchange`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ exchange_token: code, code_verifier: codeVerifier }),
+      body: JSON.stringify({
+        code: input.code,
+        code_verifier: input.code_verifier,
+        ...(input.device ? { device: input.device } : {}),
+      }),
     },
   );
   const raw: unknown = await res.json().catch(() => null);
@@ -192,7 +210,9 @@ export interface EnterpriseLoginDeps {
     callback: (payload: EnterpriseCallbackPayload) => void,
   ) => () => void;
   openExternal: (url: string) => Promise<void>;
-  exchange: (code: string, codeVerifier: string) => Promise<EnterpriseExchangeResult>;
+  exchange: (
+    input: EnterpriseExchangeInput,
+  ) => Promise<EnterpriseExchangeResult>;
   begin: (input: EnterpriseBeginInput) => Promise<EnterpriseBeginResult>;
 }
 
@@ -263,7 +283,10 @@ export async function runEnterpriseLogin(
     await deps.openExternal(txn.authorize_url);
 
     const code = await codePromise;
-    return await deps.exchange(code, pkce.verifier);
+    // The verifier stays attached to the attempt until here: it is submitted
+    // with the code so the platform can re-check S256 and bind the exchange
+    // token to this login transaction.
+    return await deps.exchange({ code, code_verifier: pkce.verifier });
   } finally {
     subscription.unsubscribe?.();
     await deps.cancelAuth().catch(() => {});

@@ -111,6 +111,73 @@ func TestCodeExchangeServerError(t *testing.T) {
 	}
 }
 
+func TestExchangeCodePostsTokenRequest(t *testing.T) {
+	client, server := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", r.Method)
+		}
+		if r.URL.Path != "/integration/v1/auth/token" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		// INT-101 token is public like authorize: no caller credential yet.
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			t.Errorf("Authorization = %q, want none", auth)
+		}
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["grant_type"] != "authorization_code" || body["code"] != "code-1" ||
+			body["code_verifier"] != "verifier-1" || body["client_id"] != "code-desktop" ||
+			body["audience"] != "code-backend" || body["device"] != "dev-1" {
+			t.Errorf("body = %v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"exchange_token": "xtok-1"})
+	}))
+	defer server.Close()
+
+	out, err := client.ExchangeCode(context.Background(), ExchangeCodeRequest{
+		Code: "code-1", CodeVerifier: "verifier-1", Device: "dev-1",
+	})
+	if err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if out.ExchangeToken != "xtok-1" {
+		t.Fatalf("ExchangeToken = %q", out.ExchangeToken)
+	}
+}
+
+func TestExchangeCodeValidatesCodeAndResponse(t *testing.T) {
+	client, _ := newTestClient(t, http.NotFoundHandler())
+	if _, err := client.ExchangeCode(context.Background(), ExchangeCodeRequest{Code: "  "}); err == nil {
+		t.Fatal("empty code accepted")
+	}
+
+	broken, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "work-audience-shape"})
+	}))
+	if _, err := broken.ExchangeCode(context.Background(), ExchangeCodeRequest{Code: "c"}); err == nil ||
+		!strings.Contains(err.Error(), "exchange_token") {
+		t.Fatalf("expected exchange_token failure, got %v", err)
+	}
+}
+
+func TestExchangeCodePlatformErrorCarriesCode(t *testing.T) {
+	client, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"code": "AUTH_CODE_REPLAYED", "message": "authorization code replayed or expired"})
+	}))
+	_, err := client.ExchangeCode(context.Background(), ExchangeCodeRequest{Code: "c", CodeVerifier: "v"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T (%v)", err, err)
+	}
+	if apiErr.Code != "AUTH_CODE_REPLAYED" || apiErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unexpected api error: %+v", apiErr)
+	}
+	if !IsCode(err, "AUTH_CODE_REPLAYED") {
+		t.Fatal("IsCode did not match")
+	}
+}
+
 func TestNewRequiresConfiguration(t *testing.T) {
 	if _, err := New(Config{}); !errors.Is(err, ErrNotConfigured) {
 		t.Fatalf("expected ErrNotConfigured, got %v", err)

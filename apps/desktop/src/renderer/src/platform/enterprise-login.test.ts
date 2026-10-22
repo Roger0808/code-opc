@@ -120,11 +120,11 @@ describe("exchangeEnterpriseCode", () => {
     vi.stubGlobal("fetch", vi.fn(impl));
   }
 
-  it("posts the code as exchange_token with the PKCE verifier", async () => {
+  it("posts the code and PKCE verifier for the server-side token step", async () => {
     stubFetch((_input: string, init?: RequestInit) => {
       expect(init?.method).toBe("POST");
       expect(JSON.parse(String(init?.body))).toEqual({
-        exchange_token: "code-1",
+        code: "code-1",
         code_verifier: "verifier-1",
       });
       return Promise.resolve(
@@ -132,15 +132,33 @@ describe("exchangeEnterpriseCode", () => {
       );
     });
 
-    const result = await exchangeEnterpriseCode(
-      "https://api.example.com/",
-      "code-1",
-      "verifier-1",
-    );
+    const result = await exchangeEnterpriseCode("https://api.example.com/", {
+      code: "code-1",
+      code_verifier: "verifier-1",
+    });
 
     expect(result.token).toBe("ent.jwt");
     expect(result.user.id).toBe("u1");
     expect(result.user.name).toBe("Yang Jing");
+  });
+
+  it("passes the device fingerprint through when provided", async () => {
+    stubFetch((_input: string, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body))).toEqual({
+        code: "code-2",
+        code_verifier: "verifier-2",
+        device: "dev-2",
+      });
+      return Promise.resolve(
+        new Response(JSON.stringify(okResponse), { status: 200 }),
+      );
+    });
+
+    await exchangeEnterpriseCode("https://api.example.com", {
+      code: "code-2",
+      code_verifier: "verifier-2",
+      device: "dev-2",
+    });
   });
 
   it("defaults user fields the shared store reads", async () => {
@@ -152,11 +170,10 @@ describe("exchangeEnterpriseCode", () => {
       ),
     );
 
-    const { user } = await exchangeEnterpriseCode(
-      "https://api.example.com",
-      "c",
-      "v",
-    );
+    const { user } = await exchangeEnterpriseCode("https://api.example.com", {
+      code: "c",
+      code_verifier: "v",
+    });
 
     expect(user.email).toBe("");
     expect(user.profile_description).toBe("");
@@ -174,7 +191,10 @@ describe("exchangeEnterpriseCode", () => {
     );
 
     await expect(
-      exchangeEnterpriseCode("https://api.example.com", "c", "v"),
+      exchangeEnterpriseCode("https://api.example.com", {
+        code: "c",
+        code_verifier: "v",
+      }),
     ).rejects.toThrow("replay detected");
   });
 
@@ -184,7 +204,10 @@ describe("exchangeEnterpriseCode", () => {
     );
 
     await expect(
-      exchangeEnterpriseCode("https://api.example.com", "c", "v"),
+      exchangeEnterpriseCode("https://api.example.com", {
+        code: "c",
+        code_verifier: "v",
+      }),
     ).rejects.toThrow(/HTTP 502/);
   });
 
@@ -198,7 +221,10 @@ describe("exchangeEnterpriseCode", () => {
     );
 
     await expect(
-      exchangeEnterpriseCode("https://api.example.com", "c", "v"),
+      exchangeEnterpriseCode("https://api.example.com", {
+        code: "c",
+        code_verifier: "v",
+      }),
     ).rejects.toThrow(/HTTP 200/);
   });
 });
@@ -208,7 +234,7 @@ describe("runEnterpriseLogin", () => {
     let callback: ((payload: { code: string } | { error: string }) => void) | null =
       null;
     const opened: string[] = [];
-    const exchanged: { code: string; codeVerifier: string }[] = [];
+    const exchanged: { code: string; code_verifier: string }[] = [];
     const beginCalls: {
       state: string;
       code_challenge: string;
@@ -232,8 +258,8 @@ describe("runEnterpriseLogin", () => {
         // The browser completes sign-in as soon as the authorize URL opens.
         callback?.({ code: "code-9" });
       }),
-      exchange: vi.fn(async (code: string, codeVerifier: string) => {
-        exchanged.push({ code, codeVerifier });
+      exchange: vi.fn(async (input) => {
+        exchanged.push({ code: input.code, code_verifier: input.code_verifier });
         return { token: "ent.jwt", user: { id: "u1" } as never };
       }),
       begin: vi.fn(async (input) => {
@@ -267,10 +293,10 @@ describe("runEnterpriseLogin", () => {
     expect(opened).toEqual([
       "https://platform.example.com/wecom/scan?txn=txn-9",
     ]);
-    // The exchange carries the attempt's PKCE verifier through to the server.
+    // The exchange carries the attempt's PKCE verifier through with the code.
     expect(exchanged).toHaveLength(1);
     expect(exchanged[0].code).toBe("code-9");
-    expect(exchanged[0].codeVerifier).toMatch(/^[A-Za-z0-9_-]{60,}$/);
+    expect(exchanged[0].code_verifier).toMatch(/^[A-Za-z0-9_-]{60,}$/);
     expect(deps.cancelAuth).toHaveBeenCalledOnce();
   });
 

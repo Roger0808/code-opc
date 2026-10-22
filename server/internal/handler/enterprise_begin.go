@@ -28,8 +28,9 @@ import (
 // host.
 
 // enterpriseClientID is the pre-registered INT-101a client id of the code
-// desktop app.
-const enterpriseClientID = "code-desktop"
+// desktop app (the platform client carries the same constant for the token
+// step, so both login calls always agree).
+const enterpriseClientID = platform.DesktopClientID
 
 // EnterpriseBeginRequest is the body of POST /api/enterprise/begin.
 type EnterpriseBeginRequest struct {
